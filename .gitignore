@@ -1,0 +1,38 @@
+# Build artifacts and binaries
+*.o
+*.so
+*.la
+*.lo
+*.a
+*.out
+
+# Compiled executables
+udpmarsdelaycli
+udpmarsdelayclo
+udpmoondelaycli
+udpmoondelayclo
+udppresetdelaycli
+udppresetdelayclo
+
+# Test executables
+simple_mars_test
+test_client
+test_compilation
+test_receiver
+test_simple
+
+# Backup files
+*.backup
+*.bak
+*~
+
+# Documentation files (excluding README)
+*.md
+!README.md
+
+# Old folder
+old/
+
+# Temporary files
+*.tmp
+temp.*
