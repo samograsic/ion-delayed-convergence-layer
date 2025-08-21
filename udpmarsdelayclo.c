@@ -74,27 +74,38 @@ static int shouldDropBundle(void)
 /* Forward declaration */
 static void processReadyBundles(int socket, struct sockaddr *sockName, unsigned char *buffer);
 
-/* Calculate Mars delay based on current orbital positions */
+/* Calculate Mars delay based on synodic period model */
 static double calculateMarsDelay(void)
 {
 	time_t now = time(NULL);
-	double earthAngle, marsAngle;
-	double earthX, earthY, marsX, marsY;
-	double distance;
 	
-	/* Simple orbital model - Earth completes orbit in ~365 days, Mars in ~687 days */
-	earthAngle = fmod((double)(now / 86400.0) * 2.0 * M_PI / 365.25, 2.0 * M_PI);
-	marsAngle = fmod((double)(now / 86400.0) * 2.0 * M_PI / 687.0, 2.0 * M_PI);
+	/* Earth-Mars synodic period is ~780 days (26 months) between oppositions */
+	/* Use sinusoidal variation between min (~54.6M km) and max (~401M km) distances */
+	#define MARS_MIN_DISTANCE 54600000.0    /* km, closest approach */
+	#define MARS_MAX_DISTANCE 401000000.0   /* km, farthest distance */
+	#define MARS_AVG_DISTANCE 227800000.0   /* km, average distance */
+	#define MARS_SYNODIC_PERIOD 780.0       /* days between oppositions */
 	
-	/* Calculate positions */
-	earthX = EARTH_ORBITAL_RADIUS * cos(earthAngle);
-	earthY = EARTH_ORBITAL_RADIUS * sin(earthAngle);
-	marsX = MARS_ORBITAL_RADIUS * cos(marsAngle);
-	marsY = MARS_ORBITAL_RADIUS * sin(marsAngle);
+	/* Calculate phase based on synodic period */
+	/* Adjust phase so we're currently near maximum distance (as observed) */
+	double daysSinceEpoch = (double)(now) / 86400.0;
+	double phase = fmod(daysSinceEpoch / MARS_SYNODIC_PERIOD + 0.4, 1.0) * 2.0 * M_PI;
 	
-	/* Calculate distance */
-	distance = sqrt((marsX - earthX) * (marsX - earthX) + 
-			(marsY - earthY) * (marsY - earthY));
+	/* Distance varies sinusoidally between min and max */
+	double distance = MARS_AVG_DISTANCE + 
+		(MARS_MAX_DISTANCE - MARS_MIN_DISTANCE) / 2.0 * cos(phase);
+	
+	/* Optional: Log the calculated distance and delay occasionally */
+	static time_t lastLogTime = 0;
+	if (now - lastLogTime > 300) {  /* Log every 5 minutes */
+		char debugMsg[256];
+		double delayMinutes = (distance / SPEED_OF_LIGHT) / 60.0;
+		snprintf(debugMsg, sizeof(debugMsg), 
+			"[DEBUG] Mars distance: %.1f million km, delay: %.1f minutes", 
+			distance / 1000000.0, delayMinutes);
+		writeMemo(debugMsg);
+		lastLogTime = now;
+	}
 	
 	/* Convert to light-travel time */
 	return distance / SPEED_OF_LIGHT;
