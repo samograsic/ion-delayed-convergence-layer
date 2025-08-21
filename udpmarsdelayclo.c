@@ -86,25 +86,29 @@ static double calculateMarsDelay(void)
 	#define MARS_AVG_DISTANCE 227800000.0   /* km, average distance */
 	#define MARS_SYNODIC_PERIOD 780.0       /* days between oppositions */
 	
-	/* Calculate phase based on synodic period */
-	/* Adjust phase so we're currently near maximum distance (as observed) */
+	/* Simplified approach: Use time-varying model with current distance calibrated */
+	/* Currently (Aug 2025) Earth-Mars distance is approximately 332 million km */
+	/* This corresponds to about 18.5 minutes light travel time */
+	
 	double daysSinceEpoch = (double)(now) / 86400.0;
-	double phase = fmod(daysSinceEpoch / MARS_SYNODIC_PERIOD + 0.4, 1.0) * 2.0 * M_PI;
 	
-	/* Distance varies sinusoidally between min and max */
+	/* Use sinusoidal variation around calibrated current distance */
+	/* Phase adjusted so current time gives approximately 332M km */
+	double phase = fmod((daysSinceEpoch + 200.0) / MARS_SYNODIC_PERIOD, 1.0) * 2.0 * M_PI;
+	
+	/* Distance varies sinusoidally around average, calibrated to current conditions */
 	double distance = MARS_AVG_DISTANCE + 
-		(MARS_MAX_DISTANCE - MARS_MIN_DISTANCE) / 2.0 * cos(phase);
+		(MARS_MAX_DISTANCE - MARS_AVG_DISTANCE) * 0.6 * sin(phase);
 	
-	/* Optional: Log the calculated distance and delay occasionally */
-	static time_t lastLogTime = 0;
-	if (now - lastLogTime > 300) {  /* Log every 5 minutes */
-		char debugMsg[256];
+	/* Debug: Log the calculated distance and delay */
+	{
+		char debugMsg[512];
 		double delayMinutes = (distance / SPEED_OF_LIGHT) / 60.0;
+		double phaseDegrees = phase * 180.0 / M_PI;
 		snprintf(debugMsg, sizeof(debugMsg), 
-			"[DEBUG] Mars distance: %.1f million km, delay: %.1f minutes", 
-			distance / 1000000.0, delayMinutes);
+			"[DEBUG] Mars: phase=%.1f°, distance=%.1f Mkm, delay=%.1f min", 
+			phaseDegrees, distance / 1000000.0, delayMinutes);
 		writeMemo(debugMsg);
-		lastLogTime = now;
 	}
 	
 	/* Convert to light-travel time */
