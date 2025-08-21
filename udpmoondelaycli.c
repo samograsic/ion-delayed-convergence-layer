@@ -420,7 +420,11 @@ int	main(int argc, char *argv[])
 				g_running = 0;
 			}
 		} else if (selectResult < 0) {
-			/* select() error */
+			/* select() error - check if interrupted by signal */
+			if (errno == EINTR) {
+				/* Interrupted by signal during shutdown - this is normal */
+				continue;
+			}
 			putSysErrmsg("Can't select on UDP socket", NULL);
 			g_running = 0;
 		}
