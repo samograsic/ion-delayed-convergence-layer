@@ -1,6 +1,6 @@
 /*
 	udpmoondelaycli.c:	UDP Moon Delay convergence-layer input daemon
-				with parallel bundle processing and link loss simulation.
+				with simplified single-threaded queue processing and link loss simulation.
 
 	Based on original ION UDP convergence layer (udpcli.c)
 	Author: Samo Grasic (samo@grasic.net), LateLab AB, Sweden
@@ -12,47 +12,37 @@
 #include "udpcla.h"
 #include "ipnfw.h"
 #include "dtn2fw.h"
+#include <fcntl.h>
+#include <errno.h>
 
 /* Moon delay constants */
-#define SPEED_OF_LIGHT 299792.458     /* km/s */
-#define MOON_AVG_DISTANCE 384400.0    /* km */
-#define MOON_VARIATION 20000.0        /* km, variation range */
-
-
+#define SPEED_OF_LIGHT 299792.458      /* km/s */
+#define MOON_DISTANCE_AVG 384400.0     /* km, average Earth-Moon distance */
+#define MOON_DISTANCE_VAR 20000.0      /* km, distance variation */
+#define MOON_ORBITAL_PERIOD 27.3       /* days */
 
 /* Link loss simulation - can be modified at compile time */
 #ifndef LINK_LOSS_PERCENTAGE
 #define LINK_LOSS_PERCENTAGE 0.0  /* 0.0 = no loss, 5.0 = 5% loss */
 #endif
 
-/* Global running flag for main thread */
-static int g_running = 1;
-
-/* Buffer management for timed bundle processing */
-#define MAX_BUFFERED_BUNDLES 100
-#define BUNDLE_BUFFER_SIZE UDPCLA_BUFSZ
+/* Simple bundle queue management - single threaded */
+#define MAX_QUEUED_BUNDLES 100
 
 typedef struct {
 	char *data;
 	int length;
 	struct sockaddr_in fromAddr;
-	struct timeval arrivalTime;
 	struct timeval processTime;  /* When to process this bundle */
-	double delaySeconds;
-	int processed;               /* Flag to mark as processed */
-} TimedBundle;
+} QueuedBundle;
 
 typedef struct {
-	TimedBundle bundles[MAX_BUFFERED_BUNDLES];
-	int head;
-	int tail;
+	QueuedBundle bundles[MAX_QUEUED_BUNDLES];
 	int count;
-	pthread_mutex_t mutex;
-	pthread_cond_t notEmpty;
-	pthread_cond_t notFull;
-	int running;
-} TimedBundleQueue;
+} BundleQueue;
 
+static BundleQueue queue;
+static int g_running = 1;
 
 /* Simulate link loss - returns 1 if bundle should be dropped */
 static int shouldDropBundle(void)
@@ -66,101 +56,53 @@ static int shouldDropBundle(void)
 	return (random < LINK_LOSS_PERCENTAGE) ? 1 : 0;
 }
 
-/* Calculate Moon delay based on current orbital position */
+/* Calculate Moon delay based on current lunar position */
 static double calculateMoonDelay(void)
 {
 	time_t now = time(NULL);
-	double moonPhase;
-	double distance;
+	double moonPhase, distance;
 	
-	/* Simple lunar orbit model - Moon completes orbit in ~27.3 days */
-	moonPhase = fmod((double)(now / 86400.0) * 2.0 * M_PI / 27.3, 2.0 * M_PI);
+	/* Calculate Moon's position in its orbit */
+	moonPhase = fmod((double)(now / 86400.0) * 2.0 * M_PI / MOON_ORBITAL_PERIOD, 2.0 * M_PI);
 	
-	/* Calculate distance with sinusoidal variation */
-	distance = MOON_AVG_DISTANCE + MOON_VARIATION * sin(moonPhase);
+	/* Calculate distance using sinusoidal variation */
+	distance = MOON_DISTANCE_AVG + (MOON_DISTANCE_VAR * cos(moonPhase));
 	
 	/* Convert to light-travel time */
 	return distance / SPEED_OF_LIGHT;
 }
 
-/* Initialize timed bundle queue */
-static void initTimedBundleQueue(TimedBundleQueue *queue)
+/* Initialize bundle queue */
+static void initQueue(void)
 {
-	queue->head = 0;
-	queue->tail = 0;
-	queue->count = 0;
-	queue->running = 1;
-	pthread_mutex_init(&queue->mutex, NULL);
-	pthread_cond_init(&queue->notEmpty, NULL);
-	pthread_cond_init(&queue->notFull, NULL);
-	
-	/* Initialize all bundle slots */
-	for (int i = 0; i < MAX_BUFFERED_BUNDLES; i++) {
-		queue->bundles[i].data = NULL;
-		queue->bundles[i].processed = 1; /* Mark as processed (empty) */
-	}
+	memset(&queue, 0, sizeof(BundleQueue));
 }
 
-/* Destroy timed bundle queue */
-static void destroyTimedBundleQueue(TimedBundleQueue *queue)
+/* Add bundle to queue */
+static int addBundle(char *data, int length, struct sockaddr_in *fromAddr)
 {
-	pthread_mutex_lock(&queue->mutex);
-	queue->running = 0;
-	
-	/* Free any remaining buffered data */
-	for (int i = 0; i < MAX_BUFFERED_BUNDLES; i++) {
-		if (queue->bundles[i].data && !queue->bundles[i].processed) {
-			MRELEASE(queue->bundles[i].data);
-			queue->bundles[i].data = NULL;
-		}
+	if (queue.count >= MAX_QUEUED_BUNDLES) {
+		return -1;  /* Queue full */
 	}
 	
-	pthread_cond_broadcast(&queue->notEmpty);
-	pthread_cond_broadcast(&queue->notFull);
-	pthread_mutex_unlock(&queue->mutex);
-	
-	pthread_mutex_destroy(&queue->mutex);
-	pthread_cond_destroy(&queue->notEmpty);
-	pthread_cond_destroy(&queue->notFull);
-}
-
-/* Add bundle to timed queue with calculated process time */
-static int enqueueTimedBundle(TimedBundleQueue *queue, const char *data, int length, 
-			      const struct sockaddr_in *fromAddr)
-{
-	pthread_mutex_lock(&queue->mutex);
-	
-	/* Wait if queue is full */
-	while (queue->count >= MAX_BUFFERED_BUNDLES && queue->running) {
-		pthread_cond_wait(&queue->notFull, &queue->mutex);
-	}
-	
-	if (!queue->running) {
-		pthread_mutex_unlock(&queue->mutex);
-		return -1;
-	}
-	
-	TimedBundle *bundle = &queue->bundles[queue->tail];
+	QueuedBundle *bundle = &queue.bundles[queue.count];
 	
 	/* Allocate and copy data */
 	bundle->data = MTAKE(length);
 	if (bundle->data == NULL) {
-		pthread_mutex_unlock(&queue->mutex);
 		return -1;
 	}
 	
 	memcpy(bundle->data, data, length);
 	bundle->length = length;
 	bundle->fromAddr = *fromAddr;
-	gettimeofday(&bundle->arrivalTime, NULL);
-	bundle->processed = 0;  /* Mark as not processed */
 	
-	/* Calculate delay for this specific bundle */
-	bundle->delaySeconds = calculateMoonDelay();
-	
-	/* Calculate when to process this bundle */
-	bundle->processTime = bundle->arrivalTime;
-	long long delayMicroseconds = (long long)(bundle->delaySeconds * 1000000.0);
+	/* Calculate process time = current time + delay */
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	bundle->processTime = now;
+	double delaySeconds = calculateMoonDelay();
+	long long delayMicroseconds = (long long)(delaySeconds * 1000000.0);
 	bundle->processTime.tv_usec += delayMicroseconds;
 	
 	/* Handle overflow */
@@ -169,200 +111,145 @@ static int enqueueTimedBundle(TimedBundleQueue *queue, const char *data, int len
 		bundle->processTime.tv_usec -= 1000000;
 	}
 	
-	queue->tail = (queue->tail + 1) % MAX_BUFFERED_BUNDLES;
-	queue->count++;
+	queue.count++;
+	return 0;
+}
+
+/* Process a bundle (after delay has elapsed) */
+static int processBundle(AcqWorkArea *work, QueuedBundle *bundle, char *hostName)
+{
+	/* Check for link loss */
+	if (shouldDropBundle()) {
+		/* Simulate bundle loss - just drop it */
+		return 0;
+	}
 	
-	pthread_cond_signal(&queue->notEmpty);
-	pthread_mutex_unlock(&queue->mutex);
+	if (bpBeginAcq(work, 0, NULL) < 0)
+	{
+		putErrmsg("Can't begin bundle acquisition.", hostName);
+		return -1;
+	}
+	
+	if (bpContinueAcq(work, bundle->data, bundle->length, 0, 0) < 0)
+	{
+		putErrmsg("Can't continue bundle acquisition.", hostName);
+		bpCancelAcq(work);
+		return -1;
+	}
+	
+	if (bpEndAcq(work) < 0)
+	{
+		putErrmsg("Can't end bundle acquisition.", hostName);
+		return -1;
+	}
 	
 	return 0;
 }
 
-/* Get the next ready bundle (non-blocking check) */
-static TimedBundle* getReadyBundle(TimedBundleQueue *queue)
+/* Process ready bundles and wait for exact timing */
+static void processReadyBundles(AcqWorkArea *work)
 {
 	struct timeval now;
-	TimedBundle* readyBundle = NULL;
+	int processed = 0;
 	
-	gettimeofday(&now, NULL);
-	
-	pthread_mutex_lock(&queue->mutex);
-	
-	/* Check all bundles to see if any are ready */
-	for (int i = 0; i < MAX_BUFFERED_BUNDLES; i++) {
-		TimedBundle *bundle = &queue->bundles[i];
-		
-		/* Skip empty slots or already processed bundles */
-		if (bundle->data == NULL || bundle->processed) {
-			continue;
-		}
+	for (int i = 0; i < queue.count; i++) {
+		QueuedBundle *bundle = &queue.bundles[i];
 		
 		/* Check if this bundle is ready to be processed */
+		gettimeofday(&now, NULL);
 		if (now.tv_sec > bundle->processTime.tv_sec ||
 		    (now.tv_sec == bundle->processTime.tv_sec && 
 		     now.tv_usec >= bundle->processTime.tv_usec)) {
 			
-			/* Mark as processed and return it */
-			bundle->processed = 1;
-			queue->count--;
-			readyBundle = bundle;
+			/* Get host name for error reporting */
+			unsigned int hostNbr;
+			char hostName[MAXHOSTNAMELEN + 1];
+			memcpy((char *) &hostNbr, (char *) &(bundle->fromAddr.sin_addr.s_addr), 4);
+			hostNbr = ntohl(hostNbr);
+			printDottedString(hostNbr, hostName);
 			
-			/* Signal waiting threads that space is available */
-			pthread_cond_signal(&queue->notFull);
-			break;
+			/* Process the bundle */
+			if (processBundle(work, bundle, hostName) < 0) {
+				putErrmsg("Can't process bundle.", NULL);
+			}
+			
+			/* Free the data */
+			if (bundle->data) {
+				MRELEASE(bundle->data);
+				bundle->data = NULL;
+			}
+			
+			/* Mark for removal */
+			bundle->length = 0;
+			processed++;
 		}
 	}
 	
-	pthread_mutex_unlock(&queue->mutex);
-	return readyBundle;
+	/* Remove processed bundles by compacting array */
+	if (processed > 0) {
+		int writeIndex = 0;
+		for (int readIndex = 0; readIndex < queue.count; readIndex++) {
+			if (queue.bundles[readIndex].length > 0) {
+				if (writeIndex != readIndex) {
+					queue.bundles[writeIndex] = queue.bundles[readIndex];
+				}
+				writeIndex++;
+			}
+		}
+		queue.count = writeIndex;
+	}
 }
 
 
-/* Process a timed bundle (after delay has elapsed) */
-static int processTimedBundle(AcqWorkArea *work, TimedBundle *bundle)
+/* Cleanup queue */
+static void destroyQueue(void)
 {
-	unsigned int hostNbr;
-	char hostName[MAXHOSTNAMELEN + 1];
-	
-	/* Check for link loss after delay - randomly drop bundle */
-	if (shouldDropBundle()) {
-		/* Simulate bundle loss - just return without processing */
-		MRELEASE(bundle->data);
-		bundle->data = NULL;
-		return 0;  /* Successfully "processed" (dropped) */
+	/* Free any remaining data */
+	for (int i = 0; i < queue.count; i++) {
+		if (queue.bundles[i].data) {
+			MRELEASE(queue.bundles[i].data);
+		}
 	}
-	
-	/* Process the bundle */
-	memcpy((char *) &hostNbr, (char *) &(bundle->fromAddr.sin_addr.s_addr), 4);
-	hostNbr = ntohl(hostNbr);
-	printDottedString(hostNbr, hostName);
-	
-	if (bpBeginAcq(work, 0, NULL) < 0
-	|| bpContinueAcq(work, bundle->data, bundle->length, 0, 0) < 0
-	|| bpEndAcq(work) < 0)
-	{
-		putErrmsg("Can't acquire bundle.", hostName);
-		MRELEASE(bundle->data);
-		bundle->data = NULL;
-		return -1;
-	}
-	
-	/* Free the bundle data */
-	MRELEASE(bundle->data);
-	bundle->data = NULL;
-	
-	return 0;
+	queue.count = 0;
 }
 
-typedef struct
-{
-	VInduct			*vduct;
-	int			ductSocket;
-	int			running;
-	TimedBundleQueue	*queue;
-} ReceiverThreadParms;
-
-
-static void	interruptThread(int signum)
+static void interruptThread(int signum)
 {
 	isignal(SIGTERM, interruptThread);
+	isignal(SIGINT, interruptThread);
+	isignal(SIGHUP, interruptThread);
 	g_running = 0;
+	writeMemo("[i] udpmoondelaycli received shutdown signal, terminating gracefully...");
 	ionKillMainThread("udpmoondelaycli");
 }
-
-static void	*handleDatagrams(void *parm)
-{
-	/*	Main loop for UDP datagram reception - queues bundles with timing	*/
-
-	ReceiverThreadParms	*rtp = (ReceiverThreadParms *) parm;
-	char			*procName = "udpmoondelaycli";
-	char			*buffer;
-	int			bundleLength;
-	struct sockaddr_in	fromAddr;
-
-	snooze(1);	/*	Let main thread become interruptible.	*/
-
-	buffer = MTAKE(UDPCLA_BUFSZ);
-	if (buffer == NULL)
-	{
-		putErrmsg("udpmoondelaycli can't get UDP buffer.", NULL);
-		ionKillMainThread(procName);
-		return NULL;
-	}
-
-	/*	Continuously receive bundles and queue them with timing info	*/
-
-	while (rtp->running)
-	{	
-		bundleLength = receiveBytesByUDP(rtp->ductSocket, &fromAddr,
-				buffer, UDPCLA_BUFSZ);
-		switch (bundleLength)
-		{
-		case -1:
-		case 0:
-			putErrmsg("Can't acquire bundle.", NULL);
-			ionKillMainThread(procName);
-
-			/*	Intentional fall-through to next case.	*/
-
-		case 1:				/*	Normal stop.	*/
-			rtp->running = 0;
-			continue;
-
-		default:
-			break;			/*	Out of switch.	*/
-		}
-
-		/* Queue bundle with calculated processing time - NON-BLOCKING */
-		if (enqueueTimedBundle(rtp->queue, buffer, bundleLength, &fromAddr) < 0) {
-			putErrmsg("Can't queue timed bundle - queue full.", NULL);
-			continue;
-		}
-
-		/*	Make sure other tasks have a chance to run.	*/
-		sm_TaskYield();
-	}
-
-	writeErrmsgMemos();
-	writeMemo("[i] udpmoondelaycli receiver thread has ended.");
-
-	/*	Free resources.						*/
-	MRELEASE(buffer);
-	return NULL;
-}
-
-/*	*	*	Main thread functions	*	*	*	*/
 
 #if defined (ION_LWT)
 int	udpmoondelaycli(saddr a1, saddr a2, saddr a3, saddr a4, saddr a5,
 		saddr a6, saddr a7, saddr a8, saddr a9, saddr a10)
 {
-	char	*ductName = (char *) a1;
+	char	*endpointSpec = (char *) a1;
 #else
 int	main(int argc, char *argv[])
 {
-	char	*ductName = (argc > 1 ? argv[1] : NULL);
+	char	*endpointSpec = (argc > 1 ? argv[1] : NULL);
 #endif
 	VInduct			*vduct;
 	PsmAddress		vductElt;
-	Sdr			sdr;
-	Induct			duct;
+	Sdr				sdr;
+	Induct			induct;
 	ClProtocol		protocol;
 	char			*hostName;
-	unsigned short		portNbr;
-	unsigned int		hostNbr;
-	struct sockaddr		socketName;
+	unsigned short	portNbr;
+	unsigned int	hostNbr;
+	struct sockaddr	socketName;
 	struct sockaddr_in	*inetName;
-	socklen_t		nameLength;
-	ReceiverThreadParms	rtp;
-	pthread_t		receiverThread;
-	TimedBundleQueue	timedQueue;
+	int				ductSocket;
 	AcqWorkArea		*work;
-	int			fd;
-	int			i;
-	char			quit = 0;
+	char			*buffer;
+	int				bundleLength;
+	struct sockaddr_in	fromAddr;
 
-	if (ductName == NULL)
+	if (endpointSpec == NULL)
 	{
 		PUTS("Usage: udpmoondelaycli <local host name>[:<port number>]");
 		return 0;
@@ -374,37 +261,41 @@ int	main(int argc, char *argv[])
 		return -1;
 	}
 
-	/* Initialize random number generator for link loss simulation */
-	srand((unsigned int)time(NULL));
-
-	findInduct("udp", ductName, &vduct, &vductElt);
+	findInduct("udp", endpointSpec, &vduct, &vductElt);
 	if (vductElt == 0)
 	{
-		putErrmsg("No such udp duct.", ductName);
+		putErrmsg("No such udp duct.", endpointSpec);
 		return -1;
 	}
 
+	/* Enhanced process check with cleanup for stale PIDs */
 	if (vduct->cliPid != ERROR && vduct->cliPid != sm_TaskIdSelf())
 	{
-		putErrmsg("CLI task is already started for this duct.",
-				itoa(vduct->cliPid));
-		return -1;
+		/* Check if the PID is actually running */
+		if (sm_TaskExists(vduct->cliPid))
+		{
+			putErrmsg("CLI task is already started for this duct.",
+					itoa(vduct->cliPid));
+			return -1;
+		}
+		else
+		{
+			/* Stale PID - clear it and continue */
+			writeMemo("[i] Clearing stale CLI PID for duct.");
+			vduct->cliPid = ERROR;
+		}
 	}
 
-	/*	All command-line arguments are now validated.		*/
+	/* All command-line arguments are now validated. */
 
 	sdr = getIonsdr();
 	CHKZERO(sdr_begin_xn(sdr));
-	sdr_read(sdr, (char *) &duct, sdr_list_data(sdr, vduct->inductElt),
+	sdr_read(sdr, (char *) &induct, sdr_list_data(sdr, vduct->inductElt),
 			sizeof(Induct));
-	sdr_read(sdr, (char *) &protocol, duct.protocol, sizeof(ClProtocol));
+	sdr_read(sdr, (char *) &protocol, induct.protocol, sizeof(ClProtocol));
 	sdr_exit_xn(sdr);
-	hostName = ductName;
-	if (parseSocketSpec(ductName, &portNbr, &hostNbr) != 0)
-	{
-		putErrmsg("Can't get IP/port for host.", hostName);
-		return -1;
-	}
+	hostName = endpointSpec;
+	parseSocketSpec(endpointSpec, &portNbr, &hostNbr);
 
 	if (portNbr == 0)
 	{
@@ -412,127 +303,144 @@ int	main(int argc, char *argv[])
 	}
 
 	portNbr = htons(portNbr);
+	if (hostNbr == 0)		/* Default to local host. */
+	{
+		hostNbr = getInternetAddress(hostName);
+	}
+
 	hostNbr = htonl(hostNbr);
-	rtp.vduct = vduct;
 	memset((char *) &socketName, 0, sizeof socketName);
 	inetName = (struct sockaddr_in *) &socketName;
 	inetName->sin_family = AF_INET;
 	inetName->sin_port = portNbr;
 	memcpy((char *) &(inetName->sin_addr.s_addr), (char *) &hostNbr, 4);
-	rtp.ductSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (rtp.ductSocket < 0)
+	ductSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (ductSocket < 0)
 	{
 		putSysErrmsg("Can't open UDP socket", NULL);
 		return -1;
 	}
 
-	nameLength = sizeof(struct sockaddr);
-	if (reUseAddress(rtp.ductSocket)
-	|| bind(rtp.ductSocket, &socketName, nameLength) < 0
-	|| getsockname(rtp.ductSocket, &socketName, &nameLength) < 0)
+	/* Enhanced socket options for better restart behavior */
+	int optval = 1;
+	if (setsockopt(ductSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
 	{
-		closesocket(rtp.ductSocket);
+		putSysErrmsg("Can't set SO_REUSEADDR", NULL);
+	}
+	
+#ifdef SO_REUSEPORT
+	if (setsockopt(ductSocket, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0)
+	{
+		/* SO_REUSEPORT not critical - continue without error */
+		writeMemo("[w] SO_REUSEPORT not available, continuing.");
+	}
+#endif
+
+	if (bind(ductSocket, &socketName, sizeof(struct sockaddr_in)) < 0)
+	{
+		closesocket(ductSocket);
 		putSysErrmsg("Can't initialize socket", NULL);
 		return -1;
 	}
 
-	/* Initialize timed bundle queue */
-	initTimedBundleQueue(&timedQueue);
-	rtp.queue = &timedQueue;
-	rtp.running = 1;
-	
-	/* Get acquisition work area for main thread bundle processing */
 	work = bpGetAcqArea(vduct);
 	if (work == NULL)
 	{
 		putErrmsg("udpmoondelaycli can't get acquisition work area.", NULL);
-		destroyTimedBundleQueue(&timedQueue);
+		closesocket(ductSocket);
 		return -1;
 	}
 
-	/*	Set up signal handling; SIGTERM is shutdown signal.	*/
+	/* Initialize random number generator for link loss simulation */
+	srand((unsigned int)time(NULL));
+	
+	/* Initialize bundle queue */
+	initQueue();
 
+	/* Set up signal handling for clean shutdown */
 	ionNoteMainThread("udpmoondelaycli");
 	isignal(SIGTERM, interruptThread);
+	isignal(SIGINT, interruptThread);
+	isignal(SIGHUP, interruptThread);
+	
+	/* Register this CLI with the vduct */
+	vduct->cliPid = sm_TaskIdSelf();
 
-	/*	Start the receiver thread.		*/
-
-	if (pthread_begin(&receiverThread, NULL, handleDatagrams, &rtp))
+	/* Allocate receive buffer */
+	buffer = MTAKE(UDPCLA_BUFSZ);
+	if (buffer == NULL)
 	{
-		closesocket(rtp.ductSocket);
-		putSysErrmsg("udpmoondelaycli can't create receiver thread", NULL);
+		putErrmsg("udpmoondelaycli can't get UDP buffer.", NULL);
+		destroyQueue();
+		closesocket(ductSocket);
 		return -1;
 	}
 
-	/*	Main processing loop - check for ready bundles	*/
-
+	/* Can now start receiving bundles. */
 	{
-		char	txt[500];
+		char	memoBuf[256];
 		double	currentDelay = calculateMoonDelay();
 
-		isprintf(txt, sizeof(txt),
-			"[i] udpmoondelaycli is running, spec=[%s:%d], Moon delay = %.1f sec, link loss = %.1f%% (timed Moon processing).", 
-			inet_ntoa(inetName->sin_addr), ntohs(portNbr), currentDelay, LINK_LOSS_PERCENTAGE);
-		writeMemo(txt);
+		isprintf(memoBuf, sizeof(memoBuf),
+				"[i] udpmoondelaycli is running, spec=[%s:%d], Moon delay = %.1f sec, link loss = %.1f%% (single-threaded queue).",
+				hostName, ntohs(portNbr), currentDelay, LINK_LOSS_PERCENTAGE);
+		writeMemo(memoBuf);
 	}
 
-
-	/*	Main processing loop - check for ready bundles	*/
-	
-	while (g_running && rtp.running) {
-		TimedBundle *readyBundle = getReadyBundle(&timedQueue);
+	/* Main processing loop - single threaded with select() for non-blocking behavior */
+	while (g_running)
+	{
+		fd_set readfds;
+		struct timeval timeout;
+		int selectResult;
 		
-		if (readyBundle != NULL) {
-			/* Process this bundle now that its delay has elapsed */
-			if (processTimedBundle(work, readyBundle) < 0) {
-				putErrmsg("Can't process timed bundle.", NULL);
+		/* Set up select() to check for data availability with short timeout */
+		FD_ZERO(&readfds);
+		FD_SET(ductSocket, &readfds);
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 1000;  /* 1ms timeout */
+		
+		selectResult = select(ductSocket + 1, &readfds, NULL, NULL, &timeout);
+		
+		if (selectResult > 0 && FD_ISSET(ductSocket, &readfds)) {
+			/* Data available - try to receive a bundle */
+			bundleLength = receiveBytesByUDP(ductSocket, &fromAddr, buffer, UDPCLA_BUFSZ);
+			
+			if (bundleLength > 1) {
+				/* Add bundle to queue for delayed processing */
+				if (addBundle(buffer, bundleLength, &fromAddr) < 0) {
+					putErrmsg("Can't queue bundle - queue full.", NULL);
+				}
+			} else if (bundleLength == 1) {
+				/* Normal stop signal */
 				g_running = 0;
-				rtp.running = 0;
-				break;
+			} else if (bundleLength < 0) {
+				/* Error receiving bundle */
+				putErrmsg("Can't receive bundle.", NULL);
+				g_running = 0;
 			}
-		} else {
-			/* No ready bundles, sleep briefly and check again */
-			microsnooze(10000);  /* Sleep 10ms */
+		} else if (selectResult < 0) {
+			/* select() error */
+			putSysErrmsg("Can't select on UDP socket", NULL);
+			g_running = 0;
 		}
+		/* selectResult == 0 means timeout - just continue to process ready bundles */
+		
+		/* Process ready bundles */
+		processReadyBundles(work);
 	}
 
-	/*	Time to shut down.					*/
-
-	rtp.running = 0;
-
-	/*	Wake up the receiver thread by sending a quit byte.	*/
-
-	if (hostNbr == 0)	/*	Receiving on INADDR_ANY.	*/
+	/* Clear CLI PID from vduct */
+	if (vduct->cliPid == sm_TaskIdSelf())
 	{
-		hostNbr = (127 << 24) + 1;	/*	127.0.0.1	*/
-		hostNbr = htonl(hostNbr);
-		memcpy((char *) &(inetName->sin_addr.s_addr),
-				(char *) &hostNbr, 4);
+		vduct->cliPid = ERROR;
 	}
-
-	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (fd >= 0)
-	{
-		for (i = 0; i < 3; i++)
-		{
-			oK(isendto(fd, &quit, 1, 0, &socketName,
-					sizeof(struct sockaddr)));
-			microsnooze(250000);
-
-			if (pthread_kill(receiverThread, SIGCONT) != 0)
-			{
-				break;
-			}
-		}
-		closesocket(fd);
-	}
-
-	pthread_detach(receiverThread);
-	closesocket(rtp.ductSocket);
+	closesocket(ductSocket);
+	MRELEASE(buffer);
 	bpReleaseAcqArea(work);
-	destroyTimedBundleQueue(&timedQueue);
+	destroyQueue();
 	writeErrmsgMemos();
-	writeMemo("[i] udpmoondelaycli has ended.");
+	writeMemo("[i] udpmoondelaycli duct has ended.");
 	ionDetach();
 	return 0;
 }

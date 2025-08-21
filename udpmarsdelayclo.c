@@ -1,6 +1,6 @@
 /*
 	udpmarsdelayclo.c:	UDP Mars Delay convergence-layer output daemon
-				with parallel bundle processing and link loss simulation.
+				with simplified single-threaded queue processing and link loss simulation.
 
 	Based on original ION UDP convergence layer (udpclo.c)
 	Author: Samo Grasic (samo@grasic.net), LateLab AB, Sweden
@@ -10,58 +10,54 @@
 */
 
 #include "udpcla.h"
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
 
 /* Mars delay constants */
 #define SPEED_OF_LIGHT 299792.458          /* km/s */
 #define EARTH_ORBITAL_RADIUS  149598000.0  /* km, 1 AU */
 #define MARS_ORBITAL_RADIUS   227939200.0  /* km, 1.52 AU */
 
-/* Buffer management */
-#define MAX_BUFFERED_BUNDLES 200
-#define BUNDLE_BUFFER_SIZE UDPCLA_BUFSZ
-#define MAX_SENDER_THREADS 50
-
 /* Link loss simulation - can be modified at compile time */
 #ifndef LINK_LOSS_PERCENTAGE
 #define LINK_LOSS_PERCENTAGE 0.0  /* 0.0 = no loss, 5.0 = 5% loss */
 #endif
 
+/* Simple bundle queue management - single threaded */
+#define MAX_QUEUED_BUNDLES 100
+
 typedef struct {
 	Object bundleZco;
 	BpAncillaryData ancillaryData;
 	unsigned int bundleLength;
-	struct timeval arrivalTime;
-	double delaySeconds;
-	struct timeval sendTime;  /* When to send this bundle */
-	int processed;            /* Flag to mark as processed */
-} BufferedBundle;
+	struct timeval sendTime;     /* When to send this bundle */
+} QueuedBundle;
 
 typedef struct {
-	BufferedBundle bundles[MAX_BUFFERED_BUNDLES];
-	int head;
-	int tail;
+	QueuedBundle bundles[MAX_QUEUED_BUNDLES];
 	int count;
-	pthread_mutex_t mutex;
-	pthread_cond_t notEmpty;
-	pthread_cond_t notFull;
-	int running;
 } BundleQueue;
 
-typedef struct {
-	BufferedBundle *bundle;
-	struct sockaddr *socketName;
-	int *ductSocket;
-	unsigned char *buffer;
-} SenderThreadData;
+static BundleQueue queue;
+static int g_running = 1;
+static pthread_mutex_t queueMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t monitorThread;
+static int ductSocket;
+static struct sockaddr socketName;
+static unsigned char *globalBuffer;
 
-typedef struct {
-	VOutduct *vduct;
-	BundleQueue *queue;
-	int running;
-	struct sockaddr *socketName;
-	int *ductSocket;
-	unsigned char *buffer;
-} OutductThreadParms;
+static sm_SemId		udpmarsdelaycloSemaphore(sm_SemId *semid)
+{
+	static sm_SemId	semaphore = -1;
+	
+	if (semid)
+	{
+		semaphore = *semid;
+	}
+
+	return semaphore;
+}
 
 /* Simulate link loss - returns 1 if bundle should be dropped */
 static int shouldDropBundle(void)
@@ -74,6 +70,9 @@ static int shouldDropBundle(void)
 	double random = ((double)rand() / RAND_MAX) * 100.0;
 	return (random < LINK_LOSS_PERCENTAGE) ? 1 : 0;
 }
+
+/* Forward declaration */
+static void processReadyBundles(int socket, struct sockaddr *sockName, unsigned char *buffer);
 
 /* Calculate Mars delay based on current orbital positions */
 static double calculateMarsDelay(void)
@@ -101,65 +100,32 @@ static double calculateMarsDelay(void)
 	return distance / SPEED_OF_LIGHT;
 }
 
-static void initBundleQueue(BundleQueue *queue)
+/* Initialize bundle queue */
+static void initQueue(void)
 {
-	queue->head = 0;
-	queue->tail = 0;
-	queue->count = 0;
-	queue->running = 1;
-	pthread_mutex_init(&queue->mutex, NULL);
-	pthread_cond_init(&queue->notEmpty, NULL);
-	pthread_cond_init(&queue->notFull, NULL);
+	memset(&queue, 0, sizeof(BundleQueue));
 }
 
-static void destroyBundleQueue(BundleQueue *queue)
+/* Add bundle to queue */
+static int addBundle(Object bundleZco, BpAncillaryData *ancillaryData, unsigned int bundleLength)
 {
-	pthread_mutex_lock(&queue->mutex);
-	queue->running = 0;
-	
-	/* Free any remaining buffered data */
-	for (int i = 0; i < MAX_BUFFERED_BUNDLES; i++) {
-		if (queue->bundles[i].bundleZco && !queue->bundles[i].processed) {
-			/* Note: bundleZco cleanup should be handled by ION's ZCO management */
-			queue->bundles[i].bundleZco = 0;
-		}
+	pthread_mutex_lock(&queueMutex);
+	if (queue.count >= MAX_QUEUED_BUNDLES) {
+		pthread_mutex_unlock(&queueMutex);
+		return -1;  /* Queue full */
 	}
 	
-	pthread_mutex_unlock(&queue->mutex);
-	pthread_mutex_destroy(&queue->mutex);
-	pthread_cond_destroy(&queue->notEmpty);
-	pthread_cond_destroy(&queue->notFull);
-}
-
-static int enqueueBundle(BundleQueue *queue, Object bundleZco, BpAncillaryData *ancillaryData, unsigned int bundleLength)
-{
-	pthread_mutex_lock(&queue->mutex);
-	
-	/* Wait if queue is full */
-	while (queue->count >= MAX_BUFFERED_BUNDLES && queue->running) {
-		pthread_cond_wait(&queue->notFull, &queue->mutex);
-	}
-	
-	if (!queue->running) {
-		pthread_mutex_unlock(&queue->mutex);
-		return -1;
-	}
-	
-	BufferedBundle *bundle = &queue->bundles[queue->tail];
-	
-	/* Store bundle data */
+	QueuedBundle *bundle = &queue.bundles[queue.count];
 	bundle->bundleZco = bundleZco;
 	bundle->ancillaryData = *ancillaryData;
 	bundle->bundleLength = bundleLength;
-	gettimeofday(&bundle->arrivalTime, NULL);
-	bundle->processed = 0;  /* Mark as not processed */
 	
-	/* Calculate delay for THIS specific bundle */
-	bundle->delaySeconds = calculateMarsDelay();
-	
-	/* Calculate when to send this bundle */
-	bundle->sendTime = bundle->arrivalTime;
-	long long delayMicroseconds = (long long)(bundle->delaySeconds * 1000000.0);
+	/* Calculate send time = current time + delay */
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	bundle->sendTime = now;
+	double delaySeconds = calculateMarsDelay();
+	long long delayMicroseconds = (long long)(delaySeconds * 1000000.0);
 	bundle->sendTime.tv_usec += delayMicroseconds;
 	
 	/* Handle overflow */
@@ -168,160 +134,170 @@ static int enqueueBundle(BundleQueue *queue, Object bundleZco, BpAncillaryData *
 		bundle->sendTime.tv_usec -= 1000000;
 	}
 	
-	queue->tail = (queue->tail + 1) % MAX_BUFFERED_BUNDLES;
-	queue->count++;
+	queue.count++;
 	
-	pthread_cond_signal(&queue->notEmpty);
-	pthread_mutex_unlock(&queue->mutex);
+	/* Debug: Log bundle queuing */
+	{
+		char debugMsg[128];
+		snprintf(debugMsg, sizeof(debugMsg), "[DEBUG] udpmarsdelayclo: Queued bundle (queue size: %d, delay: %.1f sec)", 
+				queue.count, delaySeconds);
+		writeMemo(debugMsg);
+	}
+	
+	pthread_mutex_unlock(&queueMutex);
+	return 0;
+}
+
+/* Send a bundle (after delay has elapsed) */
+static int sendBundle(int ductSocket, struct sockaddr *socketName, 
+		      QueuedBundle *bundle, unsigned char *buffer)
+{
+	/* Check for link loss */
+	if (shouldDropBundle()) {
+		/* Simulate bundle loss - just drop it and release ZCO */
+		zco_destroy(getIonsdr(), bundle->bundleZco);
+		return 0;
+	}
+	
+	/* Extract bundle content from ZCO */
+	Sdr sdr = getIonsdr();
+	CHKZERO(sdr_begin_xn(sdr));
+	ZcoReader reader;
+	zco_start_transmitting(bundle->bundleZco, &reader);
+	int bytesToSend = zco_transmit(sdr, &reader, bundle->bundleLength, (char *)buffer);
+	if (bytesToSend != bundle->bundleLength) {
+		sdr_exit_xn(sdr);
+		putErrmsg("Can't read bundle content.", NULL);
+		return -1;
+	}
+	sdr_exit_xn(sdr);
+	
+	/* Send the bundle via UDP */
+	int bytesSent = isendto(ductSocket, (char *)buffer, bytesToSend, 0, socketName, sizeof(struct sockaddr_in));
+	if (bytesSent < 0) {
+		putSysErrmsg("Can't send bundle.", NULL);
+		return -1;
+	}
+	
+	/* Debug: Log successful transmission */
+	{
+		char debugMsg[128];
+		snprintf(debugMsg, sizeof(debugMsg), "[DEBUG] udpmarsdelayclo: Sent bundle (%d bytes)", bytesSent);
+		writeMemo(debugMsg);
+	}
+	
+	/* Clean up ZCO */
+	CHKZERO(sdr_begin_xn(sdr));
+	zco_destroy(sdr, bundle->bundleZco);
+	if (sdr_end_xn(sdr) < 0) {
+		putErrmsg("Can't destroy bundle ZCO.", NULL);
+		return -1;
+	}
 	
 	return 0;
 }
 
-/* Send a single bundle in its own thread */
-static void *sendSingleBundle(void *arg)
+/* Monitor thread function - continuously checks and sends ready bundles */
+static void* queueMonitorThread(void* arg)
 {
-	SenderThreadData *data = (SenderThreadData *)arg;
-	BufferedBundle *bundle = data->bundle;
-	struct timeval now;
-	long long sleepMicroseconds;
-	int bytesSent;
+	writeMemo("[DEBUG] udpmarsdelayclo: Monitor thread started");
 	
-	/* Calculate how long to sleep until send time */
-	gettimeofday(&now, NULL);
-	
-	sleepMicroseconds = (bundle->sendTime.tv_sec - now.tv_sec) * 1000000LL +
-			    (bundle->sendTime.tv_usec - now.tv_usec);
-	
-	if (sleepMicroseconds > 0) {
-		/* Sleep until the exact send time */
-		microsnooze((unsigned int)sleepMicroseconds);
+	while (g_running) {
+		processReadyBundles(ductSocket, &socketName, globalBuffer);
+		
+		/* Sleep for 10ms to avoid busy waiting but maintain responsiveness */
+		microsnooze(10000);
 	}
 	
-	/* Check for link loss - randomly drop bundle */
-	if (shouldDropBundle()) {
-		/* Simulate bundle loss - just drop it without sending */
-		bundle->processed = 1;  /* Mark as processed */
-		free(data);
-		return NULL;
-	}
-	
-	/* Send the bundle */
-	bytesSent = sendBundleByUDP(data->socketName, data->ductSocket,
-			bundle->bundleLength, bundle->bundleZco, data->buffer);
-	
-	if (bytesSent < bundle->bundleLength) {
-		putErrmsg("Bundle transmission failed in parallel sender.", itoa(bytesSent));
-	}
-	
-	/* Mark as processed */
-	bundle->processed = 1;
-	free(data);
-	
+	writeMemo("[DEBUG] udpmarsdelayclo: Monitor thread ending");
 	return NULL;
 }
 
-/* Find ready bundles and spawn sender threads for them */
-static void *bundleScheduler(void *parm)
+/* Process ready bundles and wait for exact timing */
+static void processReadyBundles(int socket, struct sockaddr *sockName, unsigned char *buffer)
 {
-	OutductThreadParms *otp = (OutductThreadParms *)parm;
-	BundleQueue *queue = otp->queue;
 	struct timeval now;
-	pthread_t senderThread;
-	SenderThreadData *threadData;
+	int processed = 0;
 	
-	while (queue->running) {
-		pthread_mutex_lock(&queue->mutex);
+	pthread_mutex_lock(&queueMutex);
+	
+	for (int i = 0; i < queue.count; i++) {
+		QueuedBundle *bundle = &queue.bundles[i];
 		
+		/* Check if this bundle is ready to be sent */
 		gettimeofday(&now, NULL);
 		
-		/* Check all bundles to see if any are ready */
-		for (int i = 0; i < MAX_BUFFERED_BUNDLES; i++) {
-			BufferedBundle *bundle = &queue->bundles[i];
+		
+		if (now.tv_sec > bundle->sendTime.tv_sec ||
+		    (now.tv_sec == bundle->sendTime.tv_sec && 
+		     now.tv_usec >= bundle->sendTime.tv_usec)) {
 			
-			/* Skip empty slots or already processed bundles */
-			if (bundle->bundleZco == 0 || bundle->processed) {
-				continue;
+			
+			/* Send the bundle */
+			if (sendBundle(socket, sockName, bundle, buffer) < 0) {
+				putErrmsg("Can't send bundle.", NULL);
 			}
 			
-			/* Check if this bundle is ready to be sent */
-			if (now.tv_sec > bundle->sendTime.tv_sec ||
-			    (now.tv_sec == bundle->sendTime.tv_sec && 
-			     now.tv_usec >= bundle->sendTime.tv_usec)) {
-				
-				/* Create thread data */
-				threadData = malloc(sizeof(SenderThreadData));
-				if (threadData == NULL) {
-					continue;
+			/* Mark for removal */
+			bundle->bundleLength = 0;
+			processed++;
+		}
+	}
+	
+	/* Remove processed bundles by compacting array */
+	if (processed > 0) {
+		int writeIndex = 0;
+		for (int readIndex = 0; readIndex < queue.count; readIndex++) {
+			if (queue.bundles[readIndex].bundleLength > 0) {
+				if (writeIndex != readIndex) {
+					queue.bundles[writeIndex] = queue.bundles[readIndex];
 				}
-				
-				threadData->bundle = bundle;
-				threadData->socketName = otp->socketName;
-				threadData->ductSocket = otp->ductSocket;
-				threadData->buffer = otp->buffer;
-				
-				/* Spawn sender thread for this bundle */
-				if (pthread_create(&senderThread, NULL, sendSingleBundle, threadData) == 0) {
-					pthread_detach(senderThread);  /* Don't wait for it */
-					bundle->processed = 1;  /* Mark as being processed */
-				} else {
-					free(threadData);
-				}
+				writeIndex++;
 			}
 		}
-		
-		pthread_mutex_unlock(&queue->mutex);
-		
-		/* Sleep briefly before checking again */
-		microsnooze(10000);  /* 10ms */
+		queue.count = writeIndex;
 	}
 	
-	return NULL;
+	pthread_mutex_unlock(&queueMutex);
 }
 
-static sm_SemId		udpmarsdelaycloSemaphore(sm_SemId *semid)
+/* Cleanup queue */
+static void destroyQueue(void)
 {
-	static sm_SemId	semaphore = -1;
+	Sdr sdr = getIonsdr();
 	
-	if (semid)
-	{
-		semaphore = *semid;
+	/* Clean up any remaining ZCOs */
+	if (sdr_begin_xn(sdr) >= 0) {
+		for (int i = 0; i < queue.count; i++) {
+			if (queue.bundles[i].bundleZco != 0) {
+				zco_destroy(sdr, queue.bundles[i].bundleZco);
+			}
+		}
+		sdr_exit_xn(sdr);
 	}
-
-	return semaphore;
+	queue.count = 0;
 }
 
-static void	shutDownClo(int signum)
+static void shutDownClo(int signum)
 {
+	isignal(SIGTERM, shutDownClo);
+	isignal(SIGINT, shutDownClo);
+	isignal(SIGHUP, shutDownClo);
+	writeMemo("[i] udpmarsdelayclo received shutdown signal, terminating gracefully...");
+	g_running = 0;
 	sm_SemEnd(udpmarsdelaycloSemaphore(NULL));
-}
-
-/*	*	*	Main thread functions	*	*	*	*/
-
-static unsigned long	getUsecTimestamp()
-{
-	struct timeval	tv;
-
-	getCurrentTime(&tv);
-	return ((tv.tv_sec * 1000000) + tv.tv_usec);
 }
 
 #if defined (ION_LWT)
 int	udpmarsdelayclo(saddr a1, saddr a2, saddr a3, saddr a4, saddr a5,
 		saddr a6, saddr a7, saddr a8, saddr a9, saddr a10)
 {
-	char			*endpointSpec = (char *) a1;
+	char	*ductName = (char *) a1;
 #else
 int	main(int argc, char *argv[])
 {
-	char			*endpointSpec = (argc > 1 ? argv[1] : NULL);
+	char	*ductName = (argc > 1 ? argv[1] : NULL);
 #endif
-	unsigned short		portNbr;
-	unsigned int		hostNbr;
-	char			ownHostName[MAXHOSTNAMELEN];
-	struct sockaddr		socketName;
-	struct sockaddr_in	*inetName;
-
-	unsigned char		*buffer;
 	VOutduct		*vduct;
 	PsmAddress		vductElt;
 	Sdr			sdr;
@@ -331,55 +307,21 @@ int	main(int argc, char *argv[])
 	BpPlan			plan;
 	IonNeighbor		*neighbor = NULL;
 	PsmAddress		nextElt;
+	ClProtocol		protocol;
+	char			*hostName;
+	unsigned short		portNbr;
+	unsigned int		hostNbr;
+	struct sockaddr_in	*inetName;
 	Object			bundleZco;
 	BpAncillaryData		ancillaryData;
 	unsigned int		bundleLength;
-	int			ductSocket = -1;
+	unsigned char		*buffer;
 
-	/* Parallel processing components */
-	BundleQueue		bundleQueue;
-	OutductThreadParms	otp;
-	pthread_t		schedulerThread;
-
-	/*	Rate control calculation is based on treating elapsed
-	 *	time as a currency.					*/
-
-	float			timeCostPerByte;/*	In seconds.	*/
-	unsigned long		startTimestamp;	/*	Billing cycle.	*/
-	unsigned int		totalPaid;	/*	Since last send.*/
-	unsigned int		currentPaid;	/*	Sending seg.	*/
-	float			totalCostSecs;	/*	For this seg.	*/
-	unsigned int		totalCost;	/*	Microseconds.	*/
-	unsigned int		balanceDue;	/*	Until next seg.	*/
-	unsigned int		prevPaid = 0;	/*	Prior snooze.	*/
-
-	if (endpointSpec == NULL)
+	if (ductName == NULL)
 	{
-		PUTS("Usage: udpmarsdelayclo <remote node's host name>[:<its port number>]");
+		PUTS("Usage: udpmarsdelayclo <remote host name>[:<port number>]");
 		return 0;
 	}
-
-	parseSocketSpec(endpointSpec, &portNbr, &hostNbr);
-	if (portNbr == 0)
-	{
-		portNbr = BpUdpDefaultPortNbr;
-	}
-
-	portNbr = htons(portNbr);
-	if (hostNbr == 0)		/*	Default to local host.	*/
-	{
-		getNameOfHost(ownHostName, sizeof ownHostName);
-		hostNbr = getInternetAddress(ownHostName);
-	}
-
-	hostNbr = htonl(hostNbr);
-	memset((char *) &socketName, 0, sizeof socketName);
-	inetName = (struct sockaddr_in *) &socketName;
-	inetName->sin_family = AF_INET;
-	inetName->sin_port = portNbr;
-	memcpy((char *) &(inetName->sin_addr.s_addr), (char *) &hostNbr, 4);
-
-	/*	Finish validating command-line arguments.		*/
 
 	if (bpAttach() < 0)
 	{
@@ -387,34 +329,14 @@ int	main(int argc, char *argv[])
 		return -1;
 	}
 
-	/* Initialize random number generator for link loss simulation */
-	srand((unsigned int)time(NULL));
-
-	buffer = MTAKE(UDPCLA_BUFSZ);
-	if (buffer == NULL)
-	{
-		putErrmsg("No memory for UDP buffer in udpmarsdelayclo.", NULL);
-		return -1;
-	}
-
-	findOutduct("udp", endpointSpec, &vduct, &vductElt);
+	findOutduct("udp", ductName, &vduct, &vductElt);
 	if (vductElt == 0)
 	{
-		putErrmsg("No such udp duct.", endpointSpec);
-		MRELEASE(buffer);
+		putErrmsg("No such udp duct.", ductName);
 		return -1;
 	}
-
-	if (vduct->cloPid != ERROR && vduct->cloPid != sm_TaskIdSelf())
-	{
-		putErrmsg("CLO task is already started for this duct.",
-				itoa(vduct->cloPid));
-		MRELEASE(buffer);
-		return -1;
-	}
-
-	/*	All command-line arguments are now validated.		*/
-
+	
+	/* Read outduct and plan information like original udpclo */
 	neighbor = NULL;
 	sdr = getIonsdr();
 	CHKZERO(sdr_begin_xn(sdr));
@@ -429,56 +351,109 @@ int	main(int argc, char *argv[])
 			sdr_read(sdr, (char *) &plan, planObj, sizeof(BpPlan));
 		}
 	}
-
 	sdr_exit_xn(sdr);
 
-	/* Initialize bundle queue */
-	initBundleQueue(&bundleQueue);
-	otp.vduct = vduct;
-	otp.queue = &bundleQueue;
-	otp.running = 1;
-	otp.socketName = &socketName;
-	otp.ductSocket = &ductSocket;
-	otp.buffer = buffer;
-
-	/*	Set up signal handling.  SIGTERM is shutdown signal.	*/
-
-	oK(udpmarsdelaycloSemaphore(&(vduct->semaphore)));
-	isignal(SIGTERM, shutDownClo);
-
-	/* Start the scheduler thread */
-	if (pthread_begin(&schedulerThread, NULL, bundleScheduler, &otp))
+	if (vduct->cloPid != ERROR && vduct->cloPid != sm_TaskIdSelf())
 	{
-		putSysErrmsg("udpmarsdelayclo can't create scheduler thread", NULL);
-		MRELEASE(buffer);
+		if (sm_TaskExists(vduct->cloPid))
+		{
+			putErrmsg("CLO task is already started for this duct.",
+					itoa(vduct->cloPid));
+			return -1;
+		}
+		else
+		{
+			writeMemo("[i] Clearing stale CLO PID for duct.");
+			vduct->cloPid = ERROR;
+		}
+	}
+
+	sdr = getIonsdr();
+	CHKZERO(sdr_begin_xn(sdr));
+	sdr_read(sdr, (char *) &outduct, sdr_list_data(sdr, vduct->outductElt),
+			sizeof(Outduct));
+	sdr_read(sdr, (char *) &protocol, outduct.protocol, sizeof(ClProtocol));
+	sdr_exit_xn(sdr);
+	hostName = ductName;
+	parseSocketSpec(ductName, &portNbr, &hostNbr);
+	if (portNbr == 0)
+	{
+		portNbr = BpUdpDefaultPortNbr;
+	}
+
+	portNbr = htons(portNbr);
+	hostNbr = htonl(hostNbr);
+	memset((char *) &socketName, 0, sizeof socketName);
+	inetName = (struct sockaddr_in *) &socketName;
+	inetName->sin_family = AF_INET;
+	inetName->sin_port = portNbr;
+	memcpy((char *) &(inetName->sin_addr.s_addr), (char *) &hostNbr, 4);
+	ductSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (ductSocket < 0)
+	{
+		putSysErrmsg("Can't open UDP socket", NULL);
 		return -1;
 	}
 
-	/*	Can now begin transmitting to remote duct.		*/
-
+	/* Initialize random number generator for link loss simulation */
+	srand((unsigned int)time(NULL));
+	
+	/* Initialize bundle queue */
+	initQueue();
+	
+	/* Set up signal handling for clean shutdown */
+	oK(udpmarsdelaycloSemaphore(&(vduct->semaphore)));
+	isignal(SIGTERM, shutDownClo);
+	
+	/* Register this CLO with the vduct */
+	vduct->cloPid = sm_TaskIdSelf();
+	
+	/* Allocate send buffer */
+	buffer = MTAKE(UDPCLA_BUFSZ);
+	globalBuffer = buffer; /* Store for monitor thread access */
+	if (buffer == NULL)
 	{
-		char	memoBuf[1024];
+		putErrmsg("udpmarsdelayclo can't get UDP buffer.", NULL);
+		destroyQueue();
+		closesocket(ductSocket);
+		return -1;
+	}
+
+	/* Can now start sending bundles. */
+	{
+		char	memoBuf[256];
 		double	currentDelay = calculateMarsDelay();
 
 		isprintf(memoBuf, sizeof(memoBuf),
-				"[i] udpmarsdelayclo is running, spec = '%s', Mars delay = %.2f sec, link loss = %.1f%% (parallel processing)",
-				endpointSpec, currentDelay, LINK_LOSS_PERCENTAGE);
+				"[i] udpmarsdelayclo is running, spec = '%s', Mars delay = %.1f sec, link loss = %.1f%% (continuous monitoring thread).",
+				ductName, currentDelay, LINK_LOSS_PERCENTAGE);
 		writeMemo(memoBuf);
 	}
 
-	startTimestamp = getUsecTimestamp();
-	while (!(sm_SemEnded(vduct->semaphore)))
+	/* Start continuous queue monitoring thread */
+	if (pthread_create(&monitorThread, NULL, queueMonitorThread, NULL) != 0) {
+		putErrmsg("Can't create monitor thread.", NULL);
+		MRELEASE(buffer);
+		destroyQueue();
+		closesocket(ductSocket);
+		return -1;
+	}
+	
+	writeMemo("[DEBUG] udpmarsdelayclo: Monitor thread created, starting ION dequeue loop");
+
+	/* Main processing loop - ION interface only (monitor thread handles sending) */
+	while (g_running)
 	{
-		if (bpDequeue(vduct, &bundleZco, &ancillaryData, 0) < 0)
+		/* Try to dequeue a bundle from ION (blocking with timeout) */
+		if (bpDequeue(vduct, &bundleZco, &ancillaryData, 1000) < 0)
 		{
 			putErrmsg("Can't dequeue bundle.", NULL);
 			break;
 		}
-
-		if (bundleZco == 0)	/*	Outduct closed.		*/
+		
+		if (bundleZco == 0)	/*	No bundle available (timeout).		*/
 		{
-			writeMemo("[i] udpmarsdelayclo outduct closed.");
-			sm_SemEnd(udpmarsdelaycloSemaphore(NULL));/*	Stop.	*/
+			/* Monitor thread handles sending, just continue */
 			continue;
 		}
 
@@ -486,101 +461,45 @@ int	main(int argc, char *argv[])
 		{
 			continue;	/*	Get next bundle.	*/
 		}
-
-		CHKZERO(sdr_begin_xn(sdr));
-		bundleLength = zco_length(sdr, bundleZco);
-		sdr_exit_xn(sdr);
-
-		/* Enqueue bundle for parallel processing - NO BLOCKING HERE */
-		if (enqueueBundle(&bundleQueue, bundleZco, &ancillaryData, bundleLength) < 0) {
-			putErrmsg("Can't buffer bundle - queue full.", NULL);
-			continue;
-		}
-
-		/*	Rate control calculation is based on treating
-		 *	elapsed time as a currency, the price you
-		 *	pay (by microsnooze) for sending a segment
-		 *	of a given size.  All cost figures are
-		 *	expressed in microseconds except the computed
-		 *	totalCostSecs of the segment.			*/
-
-		totalPaid = getUsecTimestamp() - startTimestamp;
-
-		/*	Start clock for next bill.			*/
-
-		startTimestamp = getUsecTimestamp();
-
-		/*	Compute time balance due.			*/
-
-		if (totalPaid >= prevPaid)
+		
+		/* Valid bundle received */
 		{
-		/*	This should always be true provided that
-		 *	clock_gettime() is supported by the O/S.	*/
-
-			currentPaid = totalPaid - prevPaid;
-		}
-		else
-		{
-			currentPaid = 0;
-		}
-
-		/*	Get current time cost, in seconds, per byte.	*/
-
-		if (neighbor == NULL)
-		{
-			if (planObj && plan.neighborNodeNbr)
-			{
-				neighbor = findNeighbor(getIonVdb(),
-						plan.neighborNodeNbr, &nextElt);
+			/* Debug: Log that we received a bundle */
+			writeMemo("[DEBUG] udpmarsdelayclo: Received bundle from ION");
+			/* Get bundle length from ZCO */
+			CHKZERO(sdr_begin_xn(sdr));
+			bundleLength = zco_length(sdr, bundleZco);
+			sdr_exit_xn(sdr);
+			
+			/* Add bundle to queue for delayed sending */
+			if (addBundle(bundleZco, &ancillaryData, bundleLength) < 0) {
+				putErrmsg("Can't queue bundle - queue full.", NULL);
+				/* Still need to clean up the ZCO */
+				CHKZERO(sdr_begin_xn(sdr));
+				zco_destroy(sdr, bundleZco);
+				sdr_exit_xn(sdr);
 			}
 		}
-
-		if (neighbor && neighbor->xmitRate > 0)
-		{
-			timeCostPerByte = 1.0 / (neighbor->xmitRate);
-		}
-		else	/*	No link service rate control.		*/ 
-		{
-			timeCostPerByte = 0.0;
-		}
-
-		totalCostSecs = timeCostPerByte * computeECCC(bundleLength);
-		totalCost = totalCostSecs * 1000000.0;	/*	usec.	*/
-		if (totalCost > currentPaid)
-		{
-			balanceDue = totalCost - currentPaid;
-		}
-		else
-		{
-			balanceDue = 0;
-		}
-
-		if (balanceDue > 0)
-		{
-			microsnooze(balanceDue);
-		}
-
-		prevPaid = balanceDue;
-
-		/*	Make sure other tasks have a chance to run.	*/
-
-		sm_TaskYield();
 	}
 
-	/* Shut down parallel processing */
-	otp.running = 0;
-	bundleQueue.running = 0;
-	pthread_detach(schedulerThread);
+	/* Stop processing */
+	g_running = 0;
+	
+	/* Wait for monitor thread to finish */
+	writeMemo("[DEBUG] udpmarsdelayclo: Waiting for monitor thread to finish");
+	pthread_join(monitorThread, NULL);
 
-	if (ductSocket != -1)
+	/* Clear CLO PID from vduct */
+	if (vduct->cloPid == sm_TaskIdSelf())
 	{
-		closesocket(ductSocket);
+		vduct->cloPid = ERROR;
 	}
-
-	destroyBundleQueue(&bundleQueue);
+	
+	closesocket(ductSocket);
+	MRELEASE(buffer);
+	destroyQueue();
 	writeErrmsgMemos();
 	writeMemo("[i] udpmarsdelayclo duct has ended.");
-	MRELEASE(buffer);
 	ionDetach();
 	return 0;
 }

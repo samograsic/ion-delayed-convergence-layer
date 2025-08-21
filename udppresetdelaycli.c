@@ -1,6 +1,6 @@
 /*
 	udppresetdelaycli.c:	UDP Preset Delay convergence-layer input daemon
-				with timed bundle processing and link loss simulation.
+				with simplified single-threaded queue processing and link loss simulation.
 
 	Based on original ION UDP convergence layer (udpcli.c)
 	Author: Samo Grasic (samo@grasic.net), LateLab AB, Sweden
@@ -10,6 +10,10 @@
 */
 
 #include "udpcla.h"
+#include "ipnfw.h"
+#include "dtn2fw.h"
+#include <fcntl.h>
+#include <errno.h>
 
 /* Preset delay in seconds - can be modified at compile time */
 #ifndef PRESET_DELAY_SECONDS
@@ -21,42 +25,23 @@
 #define LINK_LOSS_PERCENTAGE 0.0  /* 0.0 = no loss, 5.0 = 5% loss */
 #endif
 
-/* Timed bundle queue management */
-#define MAX_TIMED_BUNDLES 1000
+/* Simple bundle queue management - single threaded */
+#define MAX_QUEUED_BUNDLES 100
 
 typedef struct {
 	char *data;
 	int length;
 	struct sockaddr_in fromAddr;
-	struct timeval arrivalTime;
 	struct timeval processTime;  /* When to process this bundle */
-	int processed;               /* Flag to mark as processed */
-} TimedBundle;
+} QueuedBundle;
 
 typedef struct {
-	TimedBundle bundles[MAX_TIMED_BUNDLES];
+	QueuedBundle bundles[MAX_QUEUED_BUNDLES];
 	int count;
-	pthread_mutex_t mutex;
-	int running;
-} TimedBundleQueue;
+} BundleQueue;
 
-static TimedBundleQueue timedQueue;
-
-/* Forward declarations */
-static void processReadyBundles(AcqWorkArea *work);
-
-/* Receiver thread parameters structure */
-typedef struct {
-	int linkSocket;
-	VInduct *vduct;
-	int running;
-} ReceiverThreadParms;
-
-/* Bundle processor thread parameters */
-typedef struct {
-	AcqWorkArea *work;
-	int running;
-} ProcessorThreadParms;
+static BundleQueue queue;
+static int g_running = 1;
 
 /* Simulate link loss - returns 1 if bundle should be dropped */
 static int shouldDropBundle(void)
@@ -76,41 +61,35 @@ static double getPresetDelay(void)
 	return PRESET_DELAY_SECONDS;
 }
 
-/* Initialize timed bundle queue */
-static void initTimedQueue(void)
+/* Initialize bundle queue */
+static void initQueue(void)
 {
-	memset(&timedQueue, 0, sizeof(TimedBundleQueue));
-	pthread_mutex_init(&timedQueue.mutex, NULL);
-	timedQueue.running = 1;
+	memset(&queue, 0, sizeof(BundleQueue));
 }
 
-/* Add bundle to timed queue */
-static int addTimedBundle(char *data, int length, struct sockaddr_in *fromAddr)
+/* Add bundle to queue */
+static int addBundle(char *data, int length, struct sockaddr_in *fromAddr)
 {
-	pthread_mutex_lock(&timedQueue.mutex);
-	
-	if (timedQueue.count >= MAX_TIMED_BUNDLES) {
-		pthread_mutex_unlock(&timedQueue.mutex);
+	if (queue.count >= MAX_QUEUED_BUNDLES) {
 		return -1;  /* Queue full */
 	}
 	
-	TimedBundle *bundle = &timedQueue.bundles[timedQueue.count];
+	QueuedBundle *bundle = &queue.bundles[queue.count];
 	
 	/* Allocate and copy data */
 	bundle->data = MTAKE(length);
 	if (bundle->data == NULL) {
-		pthread_mutex_unlock(&timedQueue.mutex);
 		return -1;
 	}
 	
 	memcpy(bundle->data, data, length);
 	bundle->length = length;
 	bundle->fromAddr = *fromAddr;
-	gettimeofday(&bundle->arrivalTime, NULL);
-	bundle->processed = 0;
 	
-	/* Calculate process time = arrival time + delay */
-	bundle->processTime = bundle->arrivalTime;
+	/* Calculate process time = current time + delay */
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	bundle->processTime = now;
 	double delaySeconds = getPresetDelay();
 	long long delayMicroseconds = (long long)(delaySeconds * 1000000.0);
 	bundle->processTime.tv_usec += delayMicroseconds;
@@ -121,13 +100,12 @@ static int addTimedBundle(char *data, int length, struct sockaddr_in *fromAddr)
 		bundle->processTime.tv_usec -= 1000000;
 	}
 	
-	timedQueue.count++;
-	pthread_mutex_unlock(&timedQueue.mutex);
+	queue.count++;
 	return 0;
 }
 
-/* Process a timed bundle (after delay has elapsed) */
-static int processTimedBundle(AcqWorkArea *work, TimedBundle *bundle, char *hostName)
+/* Process a bundle (after delay has elapsed) */
+static int processBundle(AcqWorkArea *work, QueuedBundle *bundle, char *hostName)
 {
 	/* Check for link loss */
 	if (shouldDropBundle()) {
@@ -135,47 +113,39 @@ static int processTimedBundle(AcqWorkArea *work, TimedBundle *bundle, char *host
 		return 0;
 	}
 	
-	/* Process bundle using ION's bundle protocol functions - ION handles SDR internally */
-	if (bpBeginAcq(work, 0, NULL) < 0
-	|| bpContinueAcq(work, bundle->data, bundle->length, 0, 0) < 0
-	|| bpEndAcq(work) < 0)
+	if (bpBeginAcq(work, 0, NULL) < 0)
 	{
-		putErrmsg("Can't acquire bundle.", hostName);
+		putErrmsg("Can't begin bundle acquisition.", hostName);
+		return -1;
+	}
+	
+	if (bpContinueAcq(work, bundle->data, bundle->length, 0, 0) < 0)
+	{
+		putErrmsg("Can't continue bundle acquisition.", hostName);
+		bpCancelAcq(work);
+		return -1;
+	}
+	
+	if (bpEndAcq(work) < 0)
+	{
+		putErrmsg("Can't end bundle acquisition.", hostName);
 		return -1;
 	}
 	
 	return 0;
 }
 
-/* Bundle processor thread */
-static void *bundleProcessor(void *parm)
-{
-	ProcessorThreadParms *ptp = (ProcessorThreadParms *)parm;
-	
-	while (ptp->running)
-	{
-		processReadyBundles(ptp->work);
-		microsnooze(10000);  /* 10ms */
-	}
-	
-	writeMemo("[i] udppresetdelaycli processor thread has ended.");
-	return NULL;
-}
-
-/* Process ready bundles (those whose time has come) */
+/* Process ready bundles and wait for exact timing */
 static void processReadyBundles(AcqWorkArea *work)
 {
 	struct timeval now;
-	gettimeofday(&now, NULL);
+	int processed = 0;
 	
-	pthread_mutex_lock(&timedQueue.mutex);
-	
-	for (int i = 0; i < timedQueue.count; i++) {
-		TimedBundle *bundle = &timedQueue.bundles[i];
-		
-		if (bundle->processed) continue;
+	for (int i = 0; i < queue.count; i++) {
+		QueuedBundle *bundle = &queue.bundles[i];
 		
 		/* Check if this bundle is ready to be processed */
+		gettimeofday(&now, NULL);
 		if (now.tv_sec > bundle->processTime.tv_sec ||
 		    (now.tv_sec == bundle->processTime.tv_sec && 
 		     now.tv_usec >= bundle->processTime.tv_usec)) {
@@ -188,107 +158,58 @@ static void processReadyBundles(AcqWorkArea *work)
 			printDottedString(hostNbr, hostName);
 			
 			/* Process the bundle */
-			if (processTimedBundle(work, bundle, hostName) < 0) {
-				putErrmsg("Can't process timed bundle.", NULL);
+			if (processBundle(work, bundle, hostName) < 0) {
+				putErrmsg("Can't process bundle.", NULL);
 			}
 			
-			bundle->processed = 1;
+			/* Free the data */
+			if (bundle->data) {
+				MRELEASE(bundle->data);
+				bundle->data = NULL;
+			}
+			
+			/* Mark for removal */
+			bundle->length = 0;
+			processed++;
 		}
 	}
 	
-	/* Clean up processed bundles by compacting the array */
-	int writeIndex = 0;
-	for (int readIndex = 0; readIndex < timedQueue.count; readIndex++) {
-		if (!timedQueue.bundles[readIndex].processed) {
-			if (writeIndex != readIndex) {
-				timedQueue.bundles[writeIndex] = timedQueue.bundles[readIndex];
-			}
-			writeIndex++;
-		} else {
-			/* Free the data for processed bundles */
-			if (timedQueue.bundles[readIndex].data) {
-				MRELEASE(timedQueue.bundles[readIndex].data);
-				timedQueue.bundles[readIndex].data = NULL;
+	/* Remove processed bundles by compacting array */
+	if (processed > 0) {
+		int writeIndex = 0;
+		for (int readIndex = 0; readIndex < queue.count; readIndex++) {
+			if (queue.bundles[readIndex].length > 0) {
+				if (writeIndex != readIndex) {
+					queue.bundles[writeIndex] = queue.bundles[readIndex];
+				}
+				writeIndex++;
 			}
 		}
+		queue.count = writeIndex;
 	}
-	timedQueue.count = writeIndex;
-	
-	pthread_mutex_unlock(&timedQueue.mutex);
 }
 
 
-/* Cleanup timed queue */
-static void destroyTimedQueue(void)
+/* Cleanup queue */
+static void destroyQueue(void)
 {
-	pthread_mutex_lock(&timedQueue.mutex);
-	timedQueue.running = 0;
-	
 	/* Free any remaining data */
-	for (int i = 0; i < timedQueue.count; i++) {
-		if (timedQueue.bundles[i].data) {
-			MRELEASE(timedQueue.bundles[i].data);
+	for (int i = 0; i < queue.count; i++) {
+		if (queue.bundles[i].data) {
+			MRELEASE(queue.bundles[i].data);
 		}
 	}
-	timedQueue.count = 0;
-	
-	pthread_mutex_unlock(&timedQueue.mutex);
-	pthread_mutex_destroy(&timedQueue.mutex);
+	queue.count = 0;
 }
 
 static void interruptThread(int signum)
 {
 	isignal(SIGTERM, interruptThread);
+	isignal(SIGINT, interruptThread);
+	isignal(SIGHUP, interruptThread);
+	g_running = 0;
+	writeMemo("[i] udppresetdelaycli received shutdown signal, terminating gracefully...");
 	ionKillMainThread("udppresetdelaycli");
-}
-
-/* UDP receiver thread */
-static void *udpReceiver(void *parm)
-{
-	ReceiverThreadParms *rtp = (ReceiverThreadParms *)parm;
-	char *buffer;
-	int bundleLength;
-	struct sockaddr_in fromAddr;
-	
-	buffer = MTAKE(UDPCLA_BUFSZ);
-	if (buffer == NULL)
-	{
-		putErrmsg("udppresetdelaycli can't get UDP buffer.", NULL);
-		ionKillMainThread("udppresetdelaycli");
-		return NULL;
-	}
-	
-	while (timedQueue.running)
-	{
-		/* fromSize not used by receiveBytesByUDP */
-		bundleLength = receiveBytesByUDP(rtp->linkSocket, &fromAddr,
-				buffer, UDPCLA_BUFSZ);
-		switch (bundleLength)
-		{
-		case -1:
-		case 0:
-			putErrmsg("Can't receive bundle.", NULL);
-			ionKillMainThread("udppresetdelaycli");
-			
-			/*	Intentional fall-through to next case.	*/
-			
-		case 1:				/*	Normal stop.	*/
-			timedQueue.running = 0;
-			continue;
-			
-		default:
-			break;			/*	Out of switch.	*/
-		}
-		
-		/* Add bundle to timed queue for delayed processing */
-		if (addTimedBundle(buffer, bundleLength, &fromAddr) < 0) {
-			putErrmsg("Can't queue timed bundle - queue full.", NULL);
-		}
-	}
-	
-	MRELEASE(buffer);
-	writeMemo("[i] udppresetdelaycli receiver thread has ended.");
-	return NULL;
 }
 
 #if defined (ION_LWT)
@@ -311,12 +232,11 @@ int	main(int argc, char *argv[])
 	unsigned int	hostNbr;
 	struct sockaddr	socketName;
 	struct sockaddr_in	*inetName;
-	ReceiverThreadParms	rtp;
-	ProcessorThreadParms	ptp;
-	pthread_t		receiverThread;
-	pthread_t		processorThread;
 	int				ductSocket;
 	AcqWorkArea		*work;
+	char			*buffer;
+	int				bundleLength;
+	struct sockaddr_in	fromAddr;
 
 	if (endpointSpec == NULL)
 	{
@@ -337,11 +257,22 @@ int	main(int argc, char *argv[])
 		return -1;
 	}
 
+	/* Enhanced process check with cleanup for stale PIDs */
 	if (vduct->cliPid != ERROR && vduct->cliPid != sm_TaskIdSelf())
 	{
-		putErrmsg("CLI task is already started for this duct.",
-				itoa(vduct->cliPid));
-		return -1;
+		/* Check if the PID is actually running */
+		if (sm_TaskExists(vduct->cliPid))
+		{
+			putErrmsg("CLI task is already started for this duct.",
+					itoa(vduct->cliPid));
+			return -1;
+		}
+		else
+		{
+			/* Stale PID - clear it and continue */
+			writeMemo("[i] Clearing stale CLI PID for duct.");
+			vduct->cliPid = ERROR;
+		}
 	}
 
 	/* All command-line arguments are now validated. */
@@ -379,7 +310,21 @@ int	main(int argc, char *argv[])
 		return -1;
 	}
 
-	reUseAddress(ductSocket);
+	/* Enhanced socket options for better restart behavior */
+	int optval = 1;
+	if (setsockopt(ductSocket, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
+	{
+		putSysErrmsg("Can't set SO_REUSEADDR", NULL);
+	}
+	
+#ifdef SO_REUSEPORT
+	if (setsockopt(ductSocket, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval)) < 0)
+	{
+		/* SO_REUSEPORT not critical - continue without error */
+		writeMemo("[w] SO_REUSEPORT not available, continuing.");
+	}
+#endif
+
 	if (bind(ductSocket, &socketName, sizeof(struct sockaddr_in)) < 0)
 	{
 		closesocket(ductSocket);
@@ -398,34 +343,24 @@ int	main(int argc, char *argv[])
 	/* Initialize random number generator for link loss simulation */
 	srand((unsigned int)time(NULL));
 	
-	/* Initialize timed bundle queue */
-	initTimedQueue();
+	/* Initialize bundle queue */
+	initQueue();
 
 	/* Set up signal handling for clean shutdown */
 	ionNoteMainThread("udppresetdelaycli");
 	isignal(SIGTERM, interruptThread);
+	isignal(SIGINT, interruptThread);
+	isignal(SIGHUP, interruptThread);
+	
+	/* Register this CLI with the vduct */
+	vduct->cliPid = sm_TaskIdSelf();
 
-	/* Start receiver thread */
-	rtp.linkSocket = ductSocket;
-	rtp.vduct = vduct;
-	rtp.running = 1;
-	if (pthread_begin(&receiverThread, NULL, udpReceiver, &rtp))
+	/* Allocate receive buffer */
+	buffer = MTAKE(UDPCLA_BUFSZ);
+	if (buffer == NULL)
 	{
-		putSysErrmsg("udppresetdelaycli can't create receiver thread", NULL);
-		destroyTimedQueue();
-		closesocket(ductSocket);
-		return -1;
-	}
-
-	/* Start bundle processor thread */
-	ptp.work = work;
-	ptp.running = 1;
-	if (pthread_begin(&processorThread, NULL, bundleProcessor, &ptp))
-	{
-		putSysErrmsg("udppresetdelaycli can't create processor thread", NULL);
-		timedQueue.running = 0;
-		pthread_join(receiverThread, NULL);
-		destroyTimedQueue();
+		putErrmsg("udppresetdelaycli can't get UDP buffer.", NULL);
+		destroyQueue();
 		closesocket(ductSocket);
 		return -1;
 	}
@@ -436,45 +371,63 @@ int	main(int argc, char *argv[])
 		double	currentDelay = getPresetDelay();
 
 		isprintf(memoBuf, sizeof(memoBuf),
-				"[i] udppresetdelaycli is running, spec=[%s:%d], preset delay = %.1f sec, link loss = %.1f%% (timed processing).",
+				"[i] udppresetdelaycli is running, spec=[%s:%d], preset delay = %.1f sec, link loss = %.1f%% (single-threaded queue).",
 				hostName, ntohs(portNbr), currentDelay, LINK_LOSS_PERCENTAGE);
 		writeMemo(memoBuf);
 	}
 
-	/* Now sleep until interrupted by SIGTERM */
-	ionPauseMainThread(-1);
-
-	/* Time to shut down */
-	timedQueue.running = 0;
-	ptp.running = 0;
-	
-	/* Create one-use socket for the closing quit byte */
-	unsigned int quitHostNbr = hostNbr;
-	if (quitHostNbr == 0)	/* Receiving on INADDR_ANY */
+	/* Main processing loop - single threaded with select() for non-blocking behavior */
+	while (g_running)
 	{
-		/* Can't send to host number 0, so send to loopback address */
-		quitHostNbr = (127 << 24) + 1;	/* 127.0.0.1 */
-		quitHostNbr = htonl(quitHostNbr);
-		struct sockaddr_in *quitInetName = (struct sockaddr_in *) &socketName;
-		memcpy((char *) &(quitInetName->sin_addr.s_addr), (char *) &quitHostNbr, 4);
-	}
-
-	/* Wake up the receiver thread by sending a 1-byte datagram */
-	int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (fd >= 0)
-	{
-		char quit = 0;
-		if (isendto(fd, &quit, 1, 0, &socketName, sizeof(struct sockaddr)) == 1)
-		{
-			pthread_join(receiverThread, NULL);
+		fd_set readfds;
+		struct timeval timeout;
+		int selectResult;
+		
+		/* Set up select() to check for data availability with short timeout */
+		FD_ZERO(&readfds);
+		FD_SET(ductSocket, &readfds);
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 1000;  /* 1ms timeout */
+		
+		selectResult = select(ductSocket + 1, &readfds, NULL, NULL, &timeout);
+		
+		if (selectResult > 0 && FD_ISSET(ductSocket, &readfds)) {
+			/* Data available - try to receive a bundle */
+			bundleLength = receiveBytesByUDP(ductSocket, &fromAddr, buffer, UDPCLA_BUFSZ);
+			
+			if (bundleLength > 1) {
+				/* Add bundle to queue for delayed processing */
+				if (addBundle(buffer, bundleLength, &fromAddr) < 0) {
+					putErrmsg("Can't queue bundle - queue full.", NULL);
+				}
+			} else if (bundleLength == 1) {
+				/* Normal stop signal */
+				g_running = 0;
+			} else if (bundleLength < 0) {
+				/* Error receiving bundle */
+				putErrmsg("Can't receive bundle.", NULL);
+				g_running = 0;
+			}
+		} else if (selectResult < 0) {
+			/* select() error */
+			putSysErrmsg("Can't select on UDP socket", NULL);
+			g_running = 0;
 		}
-		closesocket(fd);
+		/* selectResult == 0 means timeout - just continue to process ready bundles */
+		
+		/* Process ready bundles */
+		processReadyBundles(work);
 	}
-	
-	pthread_join(processorThread, NULL);
+
+	/* Clear CLI PID from vduct */
+	if (vduct->cliPid == sm_TaskIdSelf())
+	{
+		vduct->cliPid = ERROR;
+	}
 	closesocket(ductSocket);
+	MRELEASE(buffer);
 	bpReleaseAcqArea(work);
-	destroyTimedQueue();
+	destroyQueue();
 	writeErrmsgMemos();
 	writeMemo("[i] udppresetdelaycli duct has ended.");
 	ionDetach();

@@ -1,6 +1,6 @@
 # UDP Delayed Convergence Layer Adapters
 
-This repository contains three high-performance UDP delay convergence layer implementations for ION-DTN that simulate realistic space communication delays with parallel bundle processing and link loss simulation.
+This repository contains three high-performance UDP delay convergence layer implementations for ION-DTN that simulate realistic space communication delays with continuous monitoring and link loss simulation.
 
 ## Overview
 
@@ -12,8 +12,8 @@ Production-ready implementations providing three separate, self-contained varian
 
 ## Key Features
 
-- **Parallel Processing**: Each bundle processed in individual threads for exact timing precision
-- **Enhanced Capacity**: 200 bundle queue with 50 parallel processing threads
+- **Continuous Monitoring**: Independent monitoring thread ensures precise timing regardless of ION activity
+- **Enhanced Capacity**: 100 bundle queue with thread-safe operations
 - **Link Loss Simulation**: Configurable random packet dropping (0-100%)
 - **Precise Timing**: Bundles delivered at exact arrival_time + delay regardless of processing order
 - **Self-contained**: No shared libraries or ION core modifications required
@@ -153,27 +153,25 @@ All variants support configurable link loss simulation:
 
 ## Architecture
 
-### Parallel Processing Design
+### Optimized Single-Thread Design
 
-Each variant uses a sophisticated multi-threaded architecture for precise timing:
+Each variant uses an optimized architecture for precise timing and resource efficiency:
 
 **CLI (Input) Architecture:**
-- **Receiver Thread**: Non-blocking UDP packet reception and queuing
-- **Scheduler Thread**: Monitors queue and spawns processor threads at exact times
-- **Processor Threads**: Individual threads per bundle for parallel processing
+- **Main Thread**: Non-blocking UDP packet reception and queuing
+- **Queue Processing**: Single-threaded delayed bundle processing with exact timing
 - **Exact Timing**: Each bundle delivered at precisely arrival_time + calculated_delay
 
 **CLO (Output) Architecture:**
 - **Main Thread**: Non-blocking bundle dequeue from ION
+- **Monitor Thread**: Continuous queue monitoring and bundle transmission at exact times
 - **Queue Management**: Thread-safe bundle buffering with capacity management
-- **Scheduler Thread**: Monitors queue and spawns sender threads at exact times  
-- **Sender Threads**: Individual threads per bundle for parallel transmission
 
 ### Technical Implementation
 
-- **Thread-Safe Queuing**: Mutex-protected circular buffers with condition variables
+- **Thread-Safe Queuing**: Mutex-protected buffers for multi-thread coordination
 - **Memory Management**: ION-compatible MTAKE/MRELEASE for proper integration
-- **Resource Limits**: Configurable queue sizes and thread pool limits
+- **Resource Limits**: Configurable queue sizes with efficient memory usage
 - **Self-contained**: All logic embedded in each binary, no shared dependencies
 
 ## Logging
@@ -181,15 +179,15 @@ Each variant uses a sophisticated multi-threaded architecture for precise timing
 All variants log their operation to the ION log file (`ion.log`) with enhanced information:
 
 ```
-[i] udpmarsdelayclo is running, spec = '192.168.0.56:4556', Mars delay = 14.23 sec, link loss = 0.0% (parallel processing)
-[i] udpmoondelaycli is running, spec=[0.0.0.0:4556], Moon delay = 1.345 sec, link loss = 2.0% (parallel processing)
-[i] udppresetdelayclo is running, spec = '192.168.0.56:4556', preset delay = 10.0 sec, link loss = 5.0% (parallel processing)
+[i] udpmarsdelayclo is running, spec = '192.168.0.56:4556', Mars delay = 14.23 sec, link loss = 0.0% (continuous monitoring thread)
+[i] udpmoondelaycli is running, spec=[0.0.0.0:4556], Moon delay = 1.345 sec, link loss = 2.0% (single-threaded queue)
+[i] udppresetdelayclo is running, spec = '192.168.0.56:4556', preset delay = 10.0 sec, link loss = 5.0% (continuous monitoring thread)
 ```
 
 ## Advantages Over Standard UDP CL
 
-1. **Precise Timing**: Parallel processing ensures exact delay timing regardless of bundle arrival order
-2. **High Throughput**: Non-blocking architecture with 200 bundle capacity and 50 parallel threads
+1. **Precise Timing**: Continuous monitoring ensures exact delay timing regardless of bundle arrival order
+2. **High Throughput**: Non-blocking architecture with optimized queue processing
 3. **Link Loss Simulation**: Built-in configurable packet loss for realistic space communication testing
 4. **No Configuration Drift**: Self-contained implementations eliminate parameter mismatches
 5. **Production Ready**: Robust resource management and error handling
@@ -198,11 +196,11 @@ All variants log their operation to the ION log file (`ion.log`) with enhanced i
 
 ## Performance Characteristics
 
-- **Queue Capacity**: 200 simultaneous bundles
-- **Parallel Threads**: Up to 50 concurrent processor/sender threads
+- **Queue Capacity**: 100 simultaneous bundles
+- **Threading Model**: Optimized single-thread with continuous monitoring
 - **Timing Precision**: Microsecond-accurate delay implementation
 - **Memory Efficiency**: ION-compatible memory management (MTAKE/MRELEASE)
-- **Thread Safety**: Full mutex protection for all shared data structures
+- **Thread Safety**: Mutex protection for queue operations
 - **Resource Cleanup**: Proper cleanup on shutdown with pthread management
 
 ## Project Structure

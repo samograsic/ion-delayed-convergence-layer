@@ -1,6 +1,6 @@
 /*
 	udppresetdelayclo.c:	UDP Preset Delay convergence-layer output daemon
-				with timed bundle processing and link loss simulation.
+				with simplified single-threaded queue processing and link loss simulation.
 
 	Based on original ION UDP convergence layer (udpclo.c)
 	Author: Samo Grasic (samo@grasic.net), LateLab AB, Sweden
@@ -10,6 +10,9 @@
 */
 
 #include "udpcla.h"
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
 
 /* Preset delay in seconds - can be modified at compile time */
 #ifndef PRESET_DELAY_SECONDS
@@ -21,170 +24,28 @@
 #define LINK_LOSS_PERCENTAGE 0.0  /* 0.0 = no loss, 5.0 = 5% loss */
 #endif
 
-/* Timed bundle queue management */
-#define MAX_TIMED_BUNDLES 1000
+/* Simple bundle queue management - single threaded */
+#define MAX_QUEUED_BUNDLES 100
 
 typedef struct {
 	Object bundleZco;
 	BpAncillaryData ancillaryData;
 	unsigned int bundleLength;
-	struct timeval arrivalTime;
 	struct timeval sendTime;     /* When to send this bundle */
-	int processed;               /* Flag to mark as processed */
-} TimedBundle;
+} QueuedBundle;
 
 typedef struct {
-	TimedBundle bundles[MAX_TIMED_BUNDLES];
+	QueuedBundle bundles[MAX_QUEUED_BUNDLES];
 	int count;
-	pthread_mutex_t mutex;
-	int running;
-} TimedBundleQueue;
+} BundleQueue;
 
-static TimedBundleQueue timedQueue;
-
-/* Simulate link loss - returns 1 if bundle should be dropped */
-static int shouldDropBundle(void)
-{
-	if (LINK_LOSS_PERCENTAGE <= 0.0) {
-		return 0;  /* No loss */
-	}
-	
-	/* Generate random number between 0.0 and 100.0 */
-	double random = ((double)rand() / RAND_MAX) * 100.0;
-	return (random < LINK_LOSS_PERCENTAGE) ? 1 : 0;
-}
-
-/* Get preset delay */
-static double getPresetDelay(void)
-{
-	return PRESET_DELAY_SECONDS;
-}
-
-/* Initialize timed queue */
-static void initTimedQueue(void)
-{
-	memset(&timedQueue, 0, sizeof(TimedBundleQueue));
-	pthread_mutex_init(&timedQueue.mutex, NULL);
-	timedQueue.running = 1;
-}
-
-/* Add bundle to timed queue */
-static int addTimedBundle(Object bundleZco, BpAncillaryData *ancillaryData, unsigned int bundleLength)
-{
-	pthread_mutex_lock(&timedQueue.mutex);
-	
-	if (timedQueue.count >= MAX_TIMED_BUNDLES) {
-		pthread_mutex_unlock(&timedQueue.mutex);
-		return -1;  /* Queue full */
-	}
-	
-	TimedBundle *bundle = &timedQueue.bundles[timedQueue.count];
-	bundle->bundleZco = bundleZco;
-	bundle->ancillaryData = *ancillaryData;
-	bundle->bundleLength = bundleLength;
-	gettimeofday(&bundle->arrivalTime, NULL);
-	bundle->processed = 0;
-	
-	/* Calculate send time = arrival time + delay with better precision */
-	bundle->sendTime = bundle->arrivalTime;
-	double delaySeconds = getPresetDelay();
-	long delaySecondsWhole = (long)delaySeconds;
-	long delayMicroseconds = (long)((delaySeconds - delaySecondsWhole) * 1000000.0);
-	
-	bundle->sendTime.tv_sec += delaySecondsWhole;
-	bundle->sendTime.tv_usec += delayMicroseconds;
-	
-	/* Handle overflow */
-	if (bundle->sendTime.tv_usec >= 1000000) {
-		bundle->sendTime.tv_sec++;
-		bundle->sendTime.tv_usec -= 1000000;
-	}
-	
-	timedQueue.count++;
-	pthread_mutex_unlock(&timedQueue.mutex);
-	return 0;
-}
-
-/* Process ready bundles (send those whose time has come) */
-static void processReadyBundles(struct sockaddr *socketName, int *ductSocket, unsigned char *buffer, Sdr sdr, IonNeighbor *neighbor, float *timeCostPerByte, Object planObj, BpPlan *plan)
-{
-	struct timeval now;
-	gettimeofday(&now, NULL);
-	
-	/* Update neighbor if needed */
-	if (neighbor == NULL && planObj && plan->neighborNodeNbr) {
-		PsmAddress nextElt;
-		neighbor = findNeighbor(getIonVdb(), plan->neighborNodeNbr, &nextElt);
-	}
-	
-	pthread_mutex_lock(&timedQueue.mutex);
-	
-	for (int i = 0; i < timedQueue.count; i++) {
-		TimedBundle *bundle = &timedQueue.bundles[i];
-		
-		if (bundle->processed) continue;
-		
-		/* Check if this bundle is ready to be sent */
-		if (now.tv_sec > bundle->sendTime.tv_sec ||
-		    (now.tv_sec == bundle->sendTime.tv_sec && 
-		     now.tv_usec >= bundle->sendTime.tv_usec)) {
-			
-			/* Check for link loss */
-			if (shouldDropBundle()) {
-				/* Simulate bundle loss - just mark as processed */
-				bundle->processed = 1;
-				continue;
-			}
-			
-			/* Use the pre-calculated bundle length to avoid SDR conflicts */
-			unsigned int actualLength = bundle->bundleLength;
-			
-			/* Send the bundle */
-			int bytesSent = sendBundleByUDP(socketName, ductSocket,
-					actualLength, bundle->bundleZco, buffer);
-			
-			if (bytesSent < actualLength) {
-				putErrmsg("Bundle transmission failed in timed sender.", itoa(bytesSent));
-			} else {
-				/* Apply rate control only for successfully sent bundles */
-				if (neighbor && neighbor->xmitRate > 0) {
-					*timeCostPerByte = 1.0 / (neighbor->xmitRate);
-					float totalCostSecs = (*timeCostPerByte) * computeECCC(actualLength);
-					unsigned int totalCost = totalCostSecs * 1000000.0;  /* usec */
-					if (totalCost > 0) {
-						microsnooze(totalCost);
-					}
-				}
-			}
-			
-			bundle->processed = 1;
-		}
-	}
-	
-	/* Clean up processed bundles by compacting the array */
-	int writeIndex = 0;
-	for (int readIndex = 0; readIndex < timedQueue.count; readIndex++) {
-		if (!timedQueue.bundles[readIndex].processed) {
-			if (writeIndex != readIndex) {
-				timedQueue.bundles[writeIndex] = timedQueue.bundles[readIndex];
-			}
-			writeIndex++;
-		}
-	}
-	timedQueue.count = writeIndex;
-	
-	pthread_mutex_unlock(&timedQueue.mutex);
-}
-
-/* Cleanup timed queue */
-static void destroyTimedQueue(void)
-{
-	pthread_mutex_lock(&timedQueue.mutex);
-	timedQueue.running = 0;
-	timedQueue.count = 0;
-	pthread_mutex_unlock(&timedQueue.mutex);
-	pthread_mutex_destroy(&timedQueue.mutex);
-}
+static BundleQueue queue;
+static int g_running = 1;
+static pthread_mutex_t queueMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t monitorThread;
+static int ductSocket;
+static struct sockaddr socketName;
+static unsigned char *globalBuffer;
 
 static sm_SemId		udppresetdelaycloSemaphore(sm_SemId *semid)
 {
@@ -198,31 +59,239 @@ static sm_SemId		udppresetdelaycloSemaphore(sm_SemId *semid)
 	return semaphore;
 }
 
-static void	shutDownClo(int signum)
+/* Simulate link loss - returns 1 if bundle should be dropped */
+static int shouldDropBundle(void)
 {
-	sm_SemEnd(udppresetdelaycloSemaphore(NULL));
+	if (LINK_LOSS_PERCENTAGE <= 0.0) {
+		return 0;  /* No loss */
+	}
+	
+	/* Generate random number between 0.0 and 100.0 */
+	double random = ((double)rand() / RAND_MAX) * 100.0;
+	return (random < LINK_LOSS_PERCENTAGE) ? 1 : 0;
 }
 
-/*	*	*	Main thread functions	*	*	*	*/
+/* Forward declaration */
+static void processReadyBundles(int socket, struct sockaddr *sockName, unsigned char *buffer);
 
+/* Get preset delay */
+static double getPresetDelay(void)
+{
+	return PRESET_DELAY_SECONDS;
+}
+
+/* Initialize bundle queue */
+static void initQueue(void)
+{
+	memset(&queue, 0, sizeof(BundleQueue));
+}
+
+/* Add bundle to queue */
+static int addBundle(Object bundleZco, BpAncillaryData *ancillaryData, unsigned int bundleLength)
+{
+	pthread_mutex_lock(&queueMutex);
+	if (queue.count >= MAX_QUEUED_BUNDLES) {
+		pthread_mutex_unlock(&queueMutex);
+		return -1;  /* Queue full */
+	}
+	
+	QueuedBundle *bundle = &queue.bundles[queue.count];
+	bundle->bundleZco = bundleZco;
+	bundle->ancillaryData = *ancillaryData;
+	bundle->bundleLength = bundleLength;
+	
+	/* Calculate send time = current time + delay */
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	bundle->sendTime = now;
+	double delaySeconds = getPresetDelay();
+	long long delayMicroseconds = (long long)(delaySeconds * 1000000.0);
+	bundle->sendTime.tv_usec += delayMicroseconds;
+	
+	/* Handle overflow */
+	while (bundle->sendTime.tv_usec >= 1000000) {
+		bundle->sendTime.tv_sec++;
+		bundle->sendTime.tv_usec -= 1000000;
+	}
+	
+	queue.count++;
+	
+	/* Debug: Log bundle queuing */
+	{
+		char debugMsg[128];
+		snprintf(debugMsg, sizeof(debugMsg), "[DEBUG] udppresetdelayclo: Queued bundle (queue size: %d, delay: %.1f sec)", 
+				queue.count, delaySeconds);
+		writeMemo(debugMsg);
+	}
+	
+	pthread_mutex_unlock(&queueMutex);
+	return 0;
+}
+
+/* Send a bundle (after delay has elapsed) */
+static int sendBundle(int ductSocket, struct sockaddr *socketName, 
+		      QueuedBundle *bundle, unsigned char *buffer)
+{
+	/* Check for link loss */
+	if (shouldDropBundle()) {
+		/* Simulate bundle loss - just drop it and release ZCO */
+		zco_destroy(getIonsdr(), bundle->bundleZco);
+		return 0;
+	}
+	
+	/* Extract bundle content from ZCO */
+	Sdr sdr = getIonsdr();
+	CHKZERO(sdr_begin_xn(sdr));
+	ZcoReader reader;
+	zco_start_transmitting(bundle->bundleZco, &reader);
+	int bytesToSend = zco_transmit(sdr, &reader, bundle->bundleLength, (char *)buffer);
+	if (bytesToSend != bundle->bundleLength) {
+		sdr_exit_xn(sdr);
+		putErrmsg("Can't read bundle content.", NULL);
+		return -1;
+	}
+	sdr_exit_xn(sdr);
+	
+	/* Debug: Log socket parameters */
+	{
+		struct sockaddr_in *addr = (struct sockaddr_in *)socketName;
+		char debugMsg[256];
+		snprintf(debugMsg, sizeof(debugMsg), 
+			"[DEBUG] udppresetdelayclo: Sending %d bytes, socket=%d, family=%d, port=%d, addr=%08x", 
+			bytesToSend, ductSocket, addr->sin_family, ntohs(addr->sin_port), ntohl(addr->sin_addr.s_addr));
+		writeMemo(debugMsg);
+	}
+	
+	/* Send the bundle via UDP */
+	int bytesSent = isendto(ductSocket, (char *)buffer, bytesToSend, 0, socketName, sizeof(struct sockaddr_in));
+	if (bytesSent < 0) {
+		char debugMsg[256];
+		snprintf(debugMsg, sizeof(debugMsg), "[DEBUG] udppresetdelayclo: sendto failed, errno=%d", errno);
+		writeMemo(debugMsg);
+		putSysErrmsg("Can't send bundle.", NULL);
+		return -1;
+	}
+	
+	/* Debug: Log successful transmission */
+	{
+		char debugMsg[128];
+		snprintf(debugMsg, sizeof(debugMsg), "[DEBUG] udppresetdelayclo: Sent bundle (%d bytes)", bytesSent);
+		writeMemo(debugMsg);
+	}
+	
+	/* Clean up ZCO */
+	CHKZERO(sdr_begin_xn(sdr));
+	zco_destroy(sdr, bundle->bundleZco);
+	if (sdr_end_xn(sdr) < 0) {
+		putErrmsg("Can't destroy bundle ZCO.", NULL);
+		return -1;
+	}
+	
+	return 0;
+}
+
+/* Monitor thread function - continuously checks and sends ready bundles */
+static void* queueMonitorThread(void* arg)
+{
+	writeMemo("[DEBUG] udppresetdelayclo: Monitor thread started");
+	
+	while (g_running) {
+		processReadyBundles(ductSocket, &socketName, globalBuffer);
+		
+		/* Sleep for 10ms to avoid busy waiting but maintain responsiveness */
+		microsnooze(10000);
+	}
+	
+	writeMemo("[DEBUG] udppresetdelayclo: Monitor thread ending");
+	return NULL;
+}
+
+/* Process ready bundles and wait for exact timing */
+static void processReadyBundles(int socket, struct sockaddr *sockName, unsigned char *buffer)
+{
+	struct timeval now;
+	int processed = 0;
+	
+	pthread_mutex_lock(&queueMutex);
+	
+	for (int i = 0; i < queue.count; i++) {
+		QueuedBundle *bundle = &queue.bundles[i];
+		
+		/* Check if this bundle is ready to be sent */
+		gettimeofday(&now, NULL);
+		
+		
+		if (now.tv_sec > bundle->sendTime.tv_sec ||
+		    (now.tv_sec == bundle->sendTime.tv_sec && 
+		     now.tv_usec >= bundle->sendTime.tv_usec)) {
+			
+			
+			/* Send the bundle */
+			if (sendBundle(socket, sockName, bundle, buffer) < 0) {
+				putErrmsg("Can't send bundle.", NULL);
+			}
+			
+			/* Mark for removal */
+			bundle->bundleLength = 0;
+			processed++;
+		}
+	}
+	
+	/* Remove processed bundles by compacting array */
+	if (processed > 0) {
+		int writeIndex = 0;
+		for (int readIndex = 0; readIndex < queue.count; readIndex++) {
+			if (queue.bundles[readIndex].bundleLength > 0) {
+				if (writeIndex != readIndex) {
+					queue.bundles[writeIndex] = queue.bundles[readIndex];
+				}
+				writeIndex++;
+			}
+		}
+		queue.count = writeIndex;
+	}
+	
+	pthread_mutex_unlock(&queueMutex);
+}
+
+/* Cleanup queue */
+static void destroyQueue(void)
+{
+	Sdr sdr = getIonsdr();
+	
+	/* Clean up any remaining ZCOs */
+	if (sdr_begin_xn(sdr) >= 0) {
+		for (int i = 0; i < queue.count; i++) {
+			if (queue.bundles[i].bundleZco != 0) {
+				zco_destroy(sdr, queue.bundles[i].bundleZco);
+			}
+		}
+		sdr_exit_xn(sdr);
+	}
+	queue.count = 0;
+}
+
+
+static void shutDownClo(int signum)
+{
+	isignal(SIGTERM, shutDownClo);
+	isignal(SIGINT, shutDownClo);
+	isignal(SIGHUP, shutDownClo);
+	writeMemo("[i] udppresetdelayclo received shutdown signal, terminating gracefully...");
+	g_running = 0;
+	sm_SemEnd(udppresetdelaycloSemaphore(NULL));
+}
 
 #if defined (ION_LWT)
 int	udppresetdelayclo(saddr a1, saddr a2, saddr a3, saddr a4, saddr a5,
 		saddr a6, saddr a7, saddr a8, saddr a9, saddr a10)
 {
-	char			*endpointSpec = (char *) a1;
+	char	*ductName = (char *) a1;
 #else
 int	main(int argc, char *argv[])
 {
-	char			*endpointSpec = (argc > 1 ? argv[1] : NULL);
+	char	*ductName = (argc > 1 ? argv[1] : NULL);
 #endif
-	unsigned short		portNbr;
-	unsigned int		hostNbr;
-	char			ownHostName[MAXHOSTNAMELEN];
-	struct sockaddr		socketName;
-	struct sockaddr_in	*inetName;
-
-	unsigned char		*buffer;
 	VOutduct		*vduct;
 	PsmAddress		vductElt;
 	Sdr			sdr;
@@ -231,68 +300,45 @@ int	main(int argc, char *argv[])
 	Object			planObj = 0;
 	BpPlan			plan;
 	IonNeighbor		*neighbor = NULL;
+	PsmAddress		nextElt;
+	ClProtocol		protocol;
+	char			*hostName;
+	unsigned short		portNbr;
+	unsigned int		hostNbr;
+	struct sockaddr_in	*inetName;
 	Object			bundleZco;
 	BpAncillaryData		ancillaryData;
 	unsigned int		bundleLength;
-	int			ductSocket = -1;
-	float			timeCostPerByte = 0.0;
+	unsigned char		*buffer;
 
-	if (endpointSpec == NULL)
+	if (ductName == NULL)
 	{
-		PUTS("Usage: udppresetdelayclo <remote node's host name>[:<its port number>]");
+		PUTS("Usage: udppresetdelayclo <remote host name>[:<port number>]");
 		return 0;
 	}
 
-	parseSocketSpec(endpointSpec, &portNbr, &hostNbr);
-	if (portNbr == 0)
-	{
-		portNbr = BpUdpDefaultPortNbr;
-	}
-
-	portNbr = htons(portNbr);
-	if (hostNbr == 0)		/*	Default to local host.	*/
-	{
-		getNameOfHost(ownHostName, sizeof ownHostName);
-		hostNbr = getInternetAddress(ownHostName);
-	}
-
-	hostNbr = htonl(hostNbr);
-	memset((char *) &socketName, 0, sizeof socketName);
-	inetName = (struct sockaddr_in *) &socketName;
-	inetName->sin_family = AF_INET;
-	inetName->sin_port = portNbr;
-	memcpy((char *) &(inetName->sin_addr.s_addr), (char *) &hostNbr, 4);
 	if (bpAttach() < 0)
 	{
 		putErrmsg("udppresetdelayclo can't attach to BP.", NULL);
 		return -1;
 	}
 
-	buffer = MTAKE(UDPCLA_BUFSZ);
-	if (buffer == NULL)
-	{
-		putErrmsg("No memory for UDP buffer in udppresetdelayclo.", NULL);
-		return -1;
-	}
-
-	findOutduct("udp", endpointSpec, &vduct, &vductElt);
+	findOutduct("udp", ductName, &vduct, &vductElt);
 	if (vductElt == 0)
 	{
-		putErrmsg("No such udp duct.", endpointSpec);
-		MRELEASE(buffer);
+		putErrmsg("No such udp duct.", ductName);
 		return -1;
 	}
-
-	if (vduct->cloPid != ERROR && vduct->cloPid != sm_TaskIdSelf())
+	
+	/* Debug: Log successful vduct finding */
 	{
-		putErrmsg("CLO task is already started for this duct.",
-				itoa(vduct->cloPid));
-		MRELEASE(buffer);
-		return -1;
+		char debugMsg[256];
+		snprintf(debugMsg, sizeof(debugMsg), "[DEBUG] udppresetdelayclo: Found vduct for %s, semaphore ID: %d", 
+				ductName, vduct->semaphore);
+		writeMemo(debugMsg);
 	}
 
-	/*	All command-line arguments are now validated.		*/
-
+	/* Read outduct and plan information like original udpclo */
 	neighbor = NULL;
 	sdr = getIonsdr();
 	CHKZERO(sdr_begin_xn(sdr));
@@ -307,51 +353,110 @@ int	main(int argc, char *argv[])
 			sdr_read(sdr, (char *) &plan, planObj, sizeof(BpPlan));
 		}
 	}
-
 	sdr_exit_xn(sdr);
+
+	if (vduct->cloPid != ERROR && vduct->cloPid != sm_TaskIdSelf())
+	{
+		if (sm_TaskExists(vduct->cloPid))
+		{
+			putErrmsg("CLO task is already started for this duct.",
+					itoa(vduct->cloPid));
+			return -1;
+		}
+		else
+		{
+			writeMemo("[i] Clearing stale CLO PID for duct.");
+			vduct->cloPid = ERROR;
+		}
+	}
+
+	sdr = getIonsdr();
+	CHKZERO(sdr_begin_xn(sdr));
+	sdr_read(sdr, (char *) &outduct, sdr_list_data(sdr, vduct->outductElt),
+			sizeof(Outduct));
+	sdr_read(sdr, (char *) &protocol, outduct.protocol, sizeof(ClProtocol));
+	sdr_exit_xn(sdr);
+	hostName = ductName;
+	parseSocketSpec(ductName, &portNbr, &hostNbr);
+	if (portNbr == 0)
+	{
+		portNbr = BpUdpDefaultPortNbr;
+	}
+
+	portNbr = htons(portNbr);
+	hostNbr = htonl(hostNbr);
+	memset((char *) &socketName, 0, sizeof socketName);
+	inetName = (struct sockaddr_in *) &socketName;
+	inetName->sin_family = AF_INET;
+	inetName->sin_port = portNbr;
+	memcpy((char *) &(inetName->sin_addr.s_addr), (char *) &hostNbr, 4);
+	ductSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (ductSocket < 0)
+	{
+		putSysErrmsg("Can't open UDP socket", NULL);
+		return -1;
+	}
 
 	/* Initialize random number generator for link loss simulation */
 	srand((unsigned int)time(NULL));
 	
-	/* Initialize timed queue */
-	initTimedQueue();
-
-	/*	Set up signal handling.  SIGTERM is shutdown signal.	*/
-
+	/* Initialize bundle queue */
+	initQueue();
+	
+	/* Set up signal handling for clean shutdown */
 	oK(udppresetdelaycloSemaphore(&(vduct->semaphore)));
 	isignal(SIGTERM, shutDownClo);
-
-	/*	Can now begin transmitting to remote duct.		*/
-
+	
+	/* Register this CLO with the vduct */
+	vduct->cloPid = sm_TaskIdSelf();
+	
+	/* Allocate send buffer */
+	buffer = MTAKE(UDPCLA_BUFSZ);
+	globalBuffer = buffer; /* Store for monitor thread access */
+	if (buffer == NULL)
 	{
-		char	memoBuf[1024];
+		putErrmsg("udppresetdelayclo can't get UDP buffer.", NULL);
+		destroyQueue();
+		closesocket(ductSocket);
+		return -1;
+	}
+	
+
+	/* Can now start sending bundles. */
+	{
+		char	memoBuf[256];
 		double	currentDelay = getPresetDelay();
 
 		isprintf(memoBuf, sizeof(memoBuf),
-				"[i] udppresetdelayclo is running, spec = '%s', preset delay = %.1f sec, link loss = %.1f%% (timed processing)",
-				endpointSpec, currentDelay, LINK_LOSS_PERCENTAGE);
+				"[i] udppresetdelayclo is running, spec = '%s', preset delay = %.1f sec, link loss = %.1f%% (continuous monitoring thread).",
+				ductName, currentDelay, LINK_LOSS_PERCENTAGE);
 		writeMemo(memoBuf);
 	}
 
-	/* Initialize for bundle processing loop */
-	while (!(sm_SemEnded(vduct->semaphore)))
+	/* Start continuous queue monitoring thread */
+	if (pthread_create(&monitorThread, NULL, queueMonitorThread, NULL) != 0) {
+		putErrmsg("Can't create monitor thread.", NULL);
+		MRELEASE(buffer);
+		destroyQueue();
+		closesocket(ductSocket);
+		return -1;
+	}
+	
+	writeMemo("[DEBUG] udppresetdelayclo: Monitor thread created, starting ION dequeue loop");
+
+	/* Main processing loop - ION interface only (monitor thread handles sending) */
+	while (g_running)
 	{
-		/* Check if ION is shutting down before attempting operations */
-		if (getIonsdr() == NULL) {
-			writeMemo("[i] udppresetdelayclo ION shutting down.");
-			break;
-		}
-		
-		if (bpDequeue(vduct, &bundleZco, &ancillaryData, 0) < 0)
+		/* Try to dequeue a bundle from ION (blocking with timeout) */
+		if (bpDequeue(vduct, &bundleZco, &ancillaryData, 1000) < 0)
 		{
 			putErrmsg("Can't dequeue bundle.", NULL);
 			break;
 		}
-
-		if (bundleZco == 0)	/*	Outduct closed.		*/
+		
+		if (bundleZco == 0)	/*	No bundle available (timeout).		*/
 		{
-			writeMemo("[i] udppresetdelayclo outduct closed.");
-			sm_SemEnd(udppresetdelaycloSemaphore(NULL));/*	Stop.	*/
+			/* Monitor thread handles sending, just continue */
 			continue;
 		}
 
@@ -359,46 +464,45 @@ int	main(int argc, char *argv[])
 		{
 			continue;	/*	Get next bundle.	*/
 		}
-
-		/* Check SDR availability before transaction */
-		if (getIonsdr() == NULL) {
-			writeMemo("[i] udppresetdelayclo SDR unavailable during shutdown.");
-			break;
-		}
 		
-		if (sdr_begin_xn(sdr) < 0) {
-			putErrmsg("Can't begin SDR transaction.", NULL);
-			continue;
+		/* Valid bundle received */
+		{
+			/* Debug: Log that we received a bundle */
+			writeMemo("[DEBUG] udppresetdelayclo: Received bundle from ION");
+			/* Get bundle length from ZCO */
+			CHKZERO(sdr_begin_xn(sdr));
+			bundleLength = zco_length(sdr, bundleZco);
+			sdr_exit_xn(sdr);
+			
+			/* Add bundle to queue for delayed sending */
+			if (addBundle(bundleZco, &ancillaryData, bundleLength) < 0) {
+				putErrmsg("Can't queue bundle - queue full.", NULL);
+				/* Still need to clean up the ZCO */
+				CHKZERO(sdr_begin_xn(sdr));
+				zco_destroy(sdr, bundleZco);
+				sdr_exit_xn(sdr);
+			}
 		}
-		bundleLength = zco_length(sdr, bundleZco);
-		sdr_exit_xn(sdr);
-
-		/* Add bundle to timed queue for delayed sending */
-		if (addTimedBundle(bundleZco, &ancillaryData, bundleLength) < 0) {
-			putErrmsg("Can't queue timed bundle - queue full.", NULL);
-			continue;
-		}
-		
-		/* Process any ready bundles (non-blocking) */
-		processReadyBundles(&socketName, &ductSocket, buffer, sdr, neighbor, &timeCostPerByte, planObj, &plan);
-
-		/*	Make sure other tasks have a chance to run.	*/
-
-		sm_TaskYield();
 	}
 
-	/* Process any remaining bundles before shutdown */
-	processReadyBundles(&socketName, &ductSocket, buffer, sdr, neighbor, &timeCostPerByte, planObj, &plan);
+	/* Stop processing */
+	g_running = 0;
 	
-	if (ductSocket != -1)
+	/* Wait for monitor thread to finish */
+	writeMemo("[DEBUG] udppresetdelayclo: Waiting for monitor thread to finish");
+	pthread_join(monitorThread, NULL);
+	
+	/* Clear CLO PID from vduct */
+	if (vduct->cloPid == sm_TaskIdSelf())
 	{
-		closesocket(ductSocket);
+		vduct->cloPid = ERROR;
 	}
-
-	destroyTimedQueue();
+	
+	closesocket(ductSocket);
+	MRELEASE(buffer);
+	destroyQueue();
 	writeErrmsgMemos();
 	writeMemo("[i] udppresetdelayclo duct has ended.");
-	MRELEASE(buffer);
 	ionDetach();
 	return 0;
 }

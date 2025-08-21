@@ -1,5 +1,5 @@
-# Makefile for UDP Delayed Convergence Layer Adapters
-# Self-contained build with local ION headers
+# Makefile for UDP Delayed Convergence Layer Adapters - Simplified Architecture
+# Self-contained build with local ION headers - Single-threaded queue processing
 
 # Configuration
 ION_PREFIX ?= /usr/local
@@ -66,7 +66,9 @@ preset-delay:
 
 # Help target
 help:
-	@echo "UDP Delayed Convergence Layer Makefile"
+	@echo "UDP Delayed Convergence Layer Makefile - Simplified Architecture"
+	@echo ""
+	@echo "Architecture: Single-threaded queue with timestamp waiting"
 	@echo ""
 	@echo "Targets:"
 	@echo "  all              - Build all delay CL variants"
