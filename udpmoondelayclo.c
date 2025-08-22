@@ -22,7 +22,7 @@
 
 /* Link loss simulation - can be modified at compile time */
 #ifndef LINK_LOSS_PERCENTAGE
-#define LINK_LOSS_PERCENTAGE 10.0  /* 0.0 = no loss, 5.0 = 5% loss */
+#define LINK_LOSS_PERCENTAGE 0.0  /* 0.0 = no loss, 5.0 = 5% loss */
 #endif
 
 /* Simple bundle queue management - single threaded */
