@@ -2,6 +2,14 @@
 
 UDP delay convergence layer implementations for ION-DTN that simulate space communication delays with link loss simulation.
 
+## Examples
+
+### Mars Communication Delay
+![Mars Ping Test](PingMars.png)
+
+### Moon Communication Delay  
+![Moon Ping Test](PingMoon.png)
+
 ## Overview
 
 Three variants for different delay scenarios:
